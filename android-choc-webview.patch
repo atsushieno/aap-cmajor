@@ -1,0 +1,1326 @@
+diff --git a/choc/gui/android/com/tracktion/choc/ChocMainThread.java b/choc/gui/android/com/tracktion/choc/ChocMainThread.java
+new file mode 100644
+index 0000000..f487734
+--- /dev/null
++++ b/choc/gui/android/com/tracktion/choc/ChocMainThread.java
+@@ -0,0 +1,34 @@
++/*
++    This is the Java half of choc::messageloop's Android backend (see
++    choc_AndroidMainThread.h and choc_MessageLoop.h's CHOC_ANDROID branch).
++
++    It just wraps an android.os.Handler bound to the main Looper, so that
++    native code can post a token (a pointer to a heap-allocated
++    std::function<void()>) to be run on Android's UI thread. See
++    choc_AndroidMainThread.h for the C++ side of this.
++
++    This must be built into the app alongside com.tracktion.choc.gui.ChocWebView
++    (see that file's header comment for how to wire the source directory into
++    a gradle build).
++*/
++package com.tracktion.choc;
++
++import android.os.Handler;
++import android.os.Looper;
++
++public final class ChocMainThread
++{
++    public static void post (long token)
++    {
++        handler.post (() -> nativeDispatch (token));
++    }
++
++    public static void postDelayed (long token, long delayMillis)
++    {
++        handler.postDelayed (() -> nativeDispatch (token), delayMillis);
++    }
++
++    private static final Handler handler = new Handler (Looper.getMainLooper());
++
++    private static native void nativeDispatch (long token);
++}
+diff --git a/choc/gui/android/com/tracktion/choc/gui/ChocWebView.java b/choc/gui/android/com/tracktion/choc/gui/ChocWebView.java
+new file mode 100644
+index 0000000..6b30058
+--- /dev/null
++++ b/choc/gui/android/com/tracktion/choc/gui/ChocWebView.java
+@@ -0,0 +1,124 @@
++/*
++    This is the Java half of choc::ui::WebView's Android backend (see
++    choc_AndroidWebViewJNI.h and choc_WebView.h's CHOC_ANDROID branch).
++
++    choc is a header-only C++ library, so it can't ship compiled Java bytecode
++    of its own - a handful of Android APIs (the JS-to-native bridge object,
++    and the WebView evaluateJavascript() callback) can only be implemented by
++    a real, compiled Java class, not by anything JNI can synthesize at
++    runtime. This file is that class. It is intentionally tiny: almost all of
++    the logic lives on the C++ side, and this class just forwards WebView's
++    callbacks to the native* methods below (which are bound to C++ functions
++    via JNI's RegisterNatives(), from choc_AndroidWebViewJNI.h).
++
++    To use choc::ui::WebView on Android, add this file to your app's Java/Kotlin
++    sources, e.g. in a Gradle build:
++
++        android {
++            sourceSets {
++                main {
++                    java.srcDirs += 'path/to/choc/choc/gui/android'
++                }
++            }
++        }
++
++    and call choc::android::initialise (vm, applicationContext) once, from a
++    thread that's already attached to the JVM, before constructing any
++    choc::ui::WebView.
++*/
++package com.tracktion.choc.gui;
++
++import android.content.Context;
++import android.graphics.Bitmap;
++import android.graphics.Color;
++import android.webkit.JavascriptInterface;
++import android.webkit.WebResourceRequest;
++import android.webkit.WebResourceResponse;
++import android.webkit.WebView;
++import android.webkit.WebViewClient;
++
++import java.util.ArrayList;
++
++public final class ChocWebView extends WebView
++{
++    public ChocWebView (Context context, long nativeHandle)
++    {
++        super (context);
++
++        this.nativeHandle = nativeHandle;
++
++        getSettings().setJavaScriptEnabled (true);
++        getSettings().setDomStorageEnabled (true);
++
++        setWebViewClient (new WebViewClient()
++        {
++            @Override
++            public void onPageStarted (WebView view, String url, Bitmap favicon)
++            {
++                for (String script : initScripts)
++                    view.evaluateJavascript (script, null);
++            }
++
++            @Override
++            public WebResourceResponse shouldInterceptRequest (WebView view, WebResourceRequest request)
++            {
++                return nativeFetchResource (nativeHandle, request.getUrl().toString());
++            }
++        });
++
++        addJavascriptInterface (this, "chocNative");
++    }
++
++    public void navigate (String url)
++    {
++        loadUrl (url);
++    }
++
++    public void loadHTML (String html, String baseURL)
++    {
++        loadDataWithBaseURL (baseURL, html, "text/html", "utf-8", null);
++    }
++
++    public void addInitScript (String script)
++    {
++        initScripts.add (script);
++    }
++
++    public void runEvaluateJavascript (String script, long callbackToken)
++    {
++        if (callbackToken == 0)
++        {
++            evaluateJavascript (script, null);
++        }
++        else
++        {
++            evaluateJavascript (script, result ->
++                nativeEvaluationResult (nativeHandle, callbackToken, null, result));
++        }
++    }
++
++    public void setChocUserAgent (String userAgent)
++    {
++        if (! userAgent.isEmpty())
++            getSettings().setUserAgentString (userAgent);
++    }
++
++    public void setTransparentBackground (boolean transparent)
++    {
++        setBackgroundColor (transparent ? Color.TRANSPARENT : Color.WHITE);
++    }
++
++    /// Called by the page via `window.chocNative.postMessage (json)`.
++    @JavascriptInterface
++    public void postMessage (String json)
++    {
++        nativePostMessage (nativeHandle, json);
++    }
++
++    private final long nativeHandle;
++    private final ArrayList<String> initScripts = new ArrayList<> ();
++
++    private static native void nativePostMessage (long nativeHandle, String json);
++    private static native void nativeEvaluationResult (long nativeHandle, long callbackToken, String errorMessage, String resultJSON);
++    private static native WebResourceResponse nativeFetchResource (long nativeHandle, String path);
++}
+diff --git a/choc/gui/choc_AndroidWebViewJNI.h b/choc/gui/choc_AndroidWebViewJNI.h
+new file mode 100644
+index 0000000..69f85d0
+--- /dev/null
++++ b/choc/gui/choc_AndroidWebViewJNI.h
+@@ -0,0 +1,306 @@
++//
++//    ██████ ██   ██  ██████   ██████
++//   ██      ██   ██ ██    ██ ██            ** Classy Header-Only Classes **
++//   ██      ███████ ██    ██ ██
++//   ██      ██   ██ ██    ██ ██           https://github.com/Tracktion/choc
++//    ██████ ██   ██  ██████   ██████
++//
++//   CHOC is (C)2022 Tracktion Corporation, and is offered under the terms of the ISC license:
++//
++//   Permission to use, copy, modify, and/or distribute this software for any purpose with or
++//   without fee is hereby granted, provided that the above copyright notice and this permission
++//   notice appear in all copies. THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
++//   WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
++//   AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR
++//   CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
++//   WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
++//   CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++
++#ifndef CHOC_ANDROID_WEBVIEW_JNI_HEADER_INCLUDED
++#define CHOC_ANDROID_WEBVIEW_JNI_HEADER_INCLUDED
++
++#include "../platform/choc_Platform.h"
++
++#if CHOC_ANDROID
++
++#include <functional>
++#include <optional>
++#include <string>
++#include <vector>
++#include <cstdint>
++#include <iterator>
++
++#include "../platform/choc_AndroidJNIHelpers.h"
++
++//==============================================================================
++/**
++    This namespace wraps up the JNI calls needed to drive an android.webkit.WebView
++    from C++, via a small companion Java class (com.tracktion.choc.gui.ChocWebView).
++
++    choc::ui::WebView's Android backend (in choc_WebView.h) only ever talks to
++    the choc::android::NativeWebView class declared here - it never touches JNI
++    types or calls directly, which keeps all the Android-specific plumbing in
++    this one pair of files (this header, and its Java counterpart).
++
++    The hosting application must have called choc::android::initialise() (see
++    choc_AndroidJNIHelpers.h) before constructing a NativeWebView, and the
++    com.tracktion.choc.gui.ChocWebView.java class must be built into the app
++    (see that file's header comment for how to wire it into a gradle build).
++*/
++namespace choc::android
++{
++
++/// A chunk of resource data returned by a NativeWebView::Callbacks::fetchResource
++/// implementation, mirroring choc::ui::WebView::Options::Resource without this
++/// header needing to depend on choc_WebView.h.
++struct FetchedResource
++{
++    std::vector<uint8_t> data;
++    std::string mimeType;
++};
++
++//==============================================================================
++/// Owns a single android.webkit.WebView (via the ChocWebView Java helper class)
++/// and exposes plain C++ methods for controlling it. All methods must be called
++/// from the same thread that the object was constructed on, which must be
++/// Android's main (UI) thread, since that's a hard requirement of WebView itself.
++class NativeWebView
++{
++public:
++    struct Callbacks
++    {
++        /// Called when the page calls `window.chocNative.postMessage (json)`.
++        std::function<void (const std::string& json)> onPostMessage;
++
++        /// Called with the result of a previous evaluateJavascript() call that
++        /// was given a non-zero callback token. `errorMessage` is empty on success.
++        std::function<void (uint64_t callbackToken, const std::string& errorMessage, const std::string& resultJSON)> onEvaluationResult;
++
++        /// Called (on an arbitrary thread) when the page requests a resource from
++        /// the custom scheme URI. Returning std::nullopt results in a 404.
++        std::function<std::optional<FetchedResource> (const std::string& path)> fetchResource;
++    };
++
++    NativeWebView (Callbacks);
++    ~NativeWebView();
++
++    NativeWebView (const NativeWebView&) = delete;
++
++    /// True if the underlying android.webkit.WebView was created successfully.
++    bool isValid() const noexcept  { return javaView.get() != nullptr; }
++
++    /// Returns the ChocWebView instance (a jobject, i.e. an android.view.View)
++    /// as an opaque pointer, for embedding into the host app's own view hierarchy.
++    void* getViewHandle() const noexcept  { return static_cast<void*> (javaView.get()); }
++
++    void navigate (const std::string& url);
++    void loadHTML (const std::string& html, const std::string& baseURL);
++    void addInitScript (const std::string& script);
++
++    /// If callbackToken is non-zero, Callbacks::onEvaluationResult will later be
++    /// called with that token and the result.
++    void evaluateJavascript (const std::string& script, uint64_t callbackToken);
++
++    void setUserAgent (const std::string&);
++    void setTransparentBackground (bool);
++
++private:
++    //==============================================================================
++    struct JavaBindings
++    {
++        jclass viewClass = {};
++        jmethodID constructor = {};
++        jmethodID navigateMethod = {};
++        jmethodID loadHTMLMethod = {};
++        jmethodID addInitScriptMethod = {};
++        jmethodID evaluateJavascriptMethod = {};
++        jmethodID setUserAgentMethod = {};
++        jmethodID setTransparentBackgroundMethod = {};
++        jmethodID destroyMethod = {};
++    };
++
++    static JavaBindings& getBindings();
++    static void registerNativeCallbacks (JNIEnv&, jclass);
++
++    static void JNICALL nativePostMessage (JNIEnv*, jobject, jlong nativeHandle, jstring json);
++    static void JNICALL nativeEvaluationResult (JNIEnv*, jobject, jlong nativeHandle, jlong token, jstring error, jstring result);
++    static jobject JNICALL nativeFetchResource (JNIEnv*, jobject, jlong nativeHandle, jstring path);
++
++    Callbacks callbacks;
++    GlobalRef<jobject> javaView;
++};
++
++
++//==============================================================================
++//        _        _           _  _
++//     __| |  ___ | |_   __ _ (_)| | ___
++//    / _` | / _ \| __| / _` || || |/ __|
++//   | (_| ||  __/| |_ | (_| || || |\__ \ _  _  _
++//    \__,_| \___| \__| \__,_||_||_||___/(_)(_)(_)
++//
++//   Code beyond this point is implementation detail...
++//
++//==============================================================================
++
++inline NativeWebView::JavaBindings& NativeWebView::getBindings()
++{
++    static JavaBindings bindings = []
++    {
++        auto& env = *getEnv();
++        JavaBindings b;
++
++        auto localClass = findClass (env, "com/tracktion/choc/gui/ChocWebView");
++        b.viewClass = static_cast<jclass> (env.NewGlobalRef (localClass));
++        env.DeleteLocalRef (localClass);
++
++        b.constructor                     = env.GetMethodID (b.viewClass, "<init>", "(Landroid/content/Context;J)V");
++        b.navigateMethod                  = env.GetMethodID (b.viewClass, "navigate", "(Ljava/lang/String;)V");
++        b.loadHTMLMethod                  = env.GetMethodID (b.viewClass, "loadHTML", "(Ljava/lang/String;Ljava/lang/String;)V");
++        b.addInitScriptMethod             = env.GetMethodID (b.viewClass, "addInitScript", "(Ljava/lang/String;)V");
++        b.evaluateJavascriptMethod        = env.GetMethodID (b.viewClass, "runEvaluateJavascript", "(Ljava/lang/String;J)V");
++        b.setUserAgentMethod              = env.GetMethodID (b.viewClass, "setChocUserAgent", "(Ljava/lang/String;)V");
++        b.setTransparentBackgroundMethod  = env.GetMethodID (b.viewClass, "setTransparentBackground", "(Z)V");
++        b.destroyMethod                   = env.GetMethodID (b.viewClass, "destroy", "()V");
++
++        registerNativeCallbacks (env, b.viewClass);
++        checkAndClearException (env);
++        return b;
++    }();
++
++    return bindings;
++}
++
++inline void NativeWebView::registerNativeCallbacks (JNIEnv& env, jclass viewClass)
++{
++    JNINativeMethod methods[] =
++    {
++        { const_cast<char*> ("nativePostMessage"),      const_cast<char*> ("(JLjava/lang/String;)V"),                          reinterpret_cast<void*> (&NativeWebView::nativePostMessage) },
++        { const_cast<char*> ("nativeEvaluationResult"), const_cast<char*> ("(JJLjava/lang/String;Ljava/lang/String;)V"),       reinterpret_cast<void*> (&NativeWebView::nativeEvaluationResult) },
++        { const_cast<char*> ("nativeFetchResource"),    const_cast<char*> ("(JLjava/lang/String;)Landroid/webkit/WebResourceResponse;"), reinterpret_cast<void*> (&NativeWebView::nativeFetchResource) },
++    };
++
++    env.RegisterNatives (viewClass, methods, static_cast<jint> (std::size (methods)));
++}
++
++inline void JNICALL NativeWebView::nativePostMessage (JNIEnv* env, jobject, jlong nativeHandle, jstring json)
++{
++    if (auto* self = reinterpret_cast<NativeWebView*> (nativeHandle))
++        if (self->callbacks.onPostMessage)
++            self->callbacks.onPostMessage (toString (*env, json));
++}
++
++inline void JNICALL NativeWebView::nativeEvaluationResult (JNIEnv* env, jobject, jlong nativeHandle, jlong token, jstring error, jstring result)
++{
++    if (auto* self = reinterpret_cast<NativeWebView*> (nativeHandle))
++        if (self->callbacks.onEvaluationResult)
++            self->callbacks.onEvaluationResult (static_cast<uint64_t> (token), toString (*env, error), toString (*env, result));
++}
++
++inline jobject JNICALL NativeWebView::nativeFetchResource (JNIEnv* env, jobject, jlong nativeHandle, jstring path)
++{
++    auto* self = reinterpret_cast<NativeWebView*> (nativeHandle);
++
++    if (self == nullptr || ! self->callbacks.fetchResource)
++        return nullptr;
++
++    auto resource = self->callbacks.fetchResource (toString (*env, path));
++
++    if (! resource)
++        return nullptr;
++
++    auto byteArray = env->NewByteArray (static_cast<jsize> (resource->data.size()));
++    env->SetByteArrayRegion (byteArray, 0, static_cast<jsize> (resource->data.size()),
++                             reinterpret_cast<const jbyte*> (resource->data.data()));
++
++    LocalRef<jclass> streamClass (findClass (*env, "java/io/ByteArrayInputStream"));
++    auto streamCtor = env->GetMethodID (streamClass, "<init>", "([B)V");
++    LocalRef<jobject> stream (env->NewObject (streamClass, streamCtor, byteArray));
++    env->DeleteLocalRef (byteArray);
++
++    LocalRef<jclass> responseClass (findClass (*env, "android/webkit/WebResourceResponse"));
++    auto responseCtor = env->GetMethodID (responseClass, "<init>", "(Ljava/lang/String;Ljava/lang/String;Ljava/io/InputStream;)V");
++    LocalRef<jstring> mimeType (toJString (*env, resource->mimeType));
++    LocalRef<jstring> encoding (toJString (*env, "UTF-8"));
++
++    return env->NewObject (responseClass, responseCtor, mimeType.get(), encoding.get(), stream.get());
++}
++
++inline NativeWebView::NativeWebView (Callbacks cb) : callbacks (std::move (cb))
++{
++    auto& env = *getEnv();
++    auto& bindings = getBindings();
++
++    auto context = getApplicationContext();
++    CHOC_ASSERT (context != nullptr); // did you forget to call choc::android::initialise()?
++
++    auto localView = env.NewObject (bindings.viewClass, bindings.constructor, context, reinterpret_cast<jlong> (this));
++
++    if (checkAndClearException (env) || localView == nullptr)
++        return;
++
++    javaView = GlobalRef<jobject> (localView);
++    env.DeleteLocalRef (localView);
++}
++
++inline NativeWebView::~NativeWebView()
++{
++    if (javaView)
++    {
++        auto& env = *getEnv();
++        env.CallVoidMethod (javaView, getBindings().destroyMethod);
++        checkAndClearException (env);
++    }
++}
++
++inline void NativeWebView::navigate (const std::string& url)
++{
++    auto& env = *getEnv();
++    LocalRef<jstring> jurl (toJString (env, url));
++    env.CallVoidMethod (javaView, getBindings().navigateMethod, jurl.get());
++    checkAndClearException (env);
++}
++
++inline void NativeWebView::loadHTML (const std::string& html, const std::string& baseURL)
++{
++    auto& env = *getEnv();
++    LocalRef<jstring> jhtml (toJString (env, html));
++    LocalRef<jstring> jbase (toJString (env, baseURL));
++    env.CallVoidMethod (javaView, getBindings().loadHTMLMethod, jhtml.get(), jbase.get());
++    checkAndClearException (env);
++}
++
++inline void NativeWebView::addInitScript (const std::string& script)
++{
++    auto& env = *getEnv();
++    LocalRef<jstring> jscript (toJString (env, script));
++    env.CallVoidMethod (javaView, getBindings().addInitScriptMethod, jscript.get());
++    checkAndClearException (env);
++}
++
++inline void NativeWebView::evaluateJavascript (const std::string& script, uint64_t callbackToken)
++{
++    auto& env = *getEnv();
++    LocalRef<jstring> jscript (toJString (env, script));
++    env.CallVoidMethod (javaView, getBindings().evaluateJavascriptMethod, jscript.get(), static_cast<jlong> (callbackToken));
++    checkAndClearException (env);
++}
++
++inline void NativeWebView::setUserAgent (const std::string& userAgent)
++{
++    auto& env = *getEnv();
++    LocalRef<jstring> jua (toJString (env, userAgent));
++    env.CallVoidMethod (javaView, getBindings().setUserAgentMethod, jua.get());
++    checkAndClearException (env);
++}
++
++inline void NativeWebView::setTransparentBackground (bool transparent)
++{
++    auto& env = *getEnv();
++    env.CallVoidMethod (javaView, getBindings().setTransparentBackgroundMethod, static_cast<jboolean> (transparent));
++    checkAndClearException (env);
++}
++
++} // namespace choc::android
++
++#endif // CHOC_ANDROID
++#endif // CHOC_ANDROID_WEBVIEW_JNI_HEADER_INCLUDED
+diff --git a/choc/gui/choc_DesktopWindow.h b/choc/gui/choc_DesktopWindow.h
+index 3900a07..7b9daa4 100644
+--- a/choc/gui/choc_DesktopWindow.h
++++ b/choc/gui/choc_DesktopWindow.h
+@@ -324,6 +324,36 @@ struct choc::ui::DesktopWindow::Pimpl
+ 
+ inline void choc::ui::setWindowsDPIAwareness() {}
+ 
++//==============================================================================
++#elif CHOC_ANDROID
++
++// Android has no concept of an OS-level desktop window for an app to create -
++// a choc::ui::WebView is instead embedded directly into the host app's own
++// View hierarchy (see choc_WebView.h's CHOC_ANDROID backend, whose
++// getViewHandle() returns a jobject for the app to attach itself). This Pimpl
++// is only here so that code written for choc's other platforms still compiles
++// and links when built for Android; none of it does anything.
++struct choc::ui::DesktopWindow::Pimpl
++{
++    Pimpl (DesktopWindow&, Bounds) {}
++
++    void* getWindowHandle() const                    { return nullptr; }
++    void setContent (void*)                          {}
++    void setVisible (bool)                           {}
++    void setWindowTitle (const std::string&)         {}
++    void setMinimumSize (int, int)                    {}
++    void setMaximumSize (int, int)                    {}
++    void setResizable (bool)                         {}
++    void setClosable (bool)                          {}
++    void setBounds (Bounds)                          {}
++    Bounds getBounds()                                { return {}; }
++    void centreWithSize (int, int)                    {}
++    void toFront()                                    {}
++    void setFileDropCallback (FileDropCallback)       {}
++};
++
++inline void choc::ui::setWindowsDPIAwareness() {}
++
+ //==============================================================================
+ #elif CHOC_APPLE
+ 
+diff --git a/choc/gui/choc_MessageLoop.h b/choc/gui/choc_MessageLoop.h
+index 89d6059..da0f7b6 100644
+--- a/choc/gui/choc_MessageLoop.h
++++ b/choc/gui/choc_MessageLoop.h
+@@ -228,6 +228,145 @@ struct Timer::Pimpl
+     guint handle;
+ };
+ 
++//==============================================================================
++#elif CHOC_ANDROID
++
++#include <thread>
++#include <mutex>
++#include <condition_variable>
++#include <unordered_set>
++
++#include "../platform/choc_AndroidMainThread.h"
++
++namespace choc::messageloop
++{
++
++inline std::thread::id& getMainThreadIDRef()
++{
++    static std::thread::id i;
++    return i;
++}
++
++inline void initialise()
++{
++    getMainThreadIDRef() = std::this_thread::get_id();
++}
++
++inline bool callerIsOnMessageThread()
++{
++    return getMainThreadIDRef() == std::this_thread::get_id();
++}
++
++inline void postMessage (std::function<void()>&& fn)
++{
++    choc::android::postToMainThread (std::move (fn));
++}
++
++namespace detail
++{
++    // NB: on Android, the main thread's message loop is owned and pumped by
++    // the OS as part of ActivityThread, so a real app should never need to
++    // call choc::messageloop::run()/stop() - it should just call initialise()
++    // once from its main thread, and let Android's own Looper drive things
++    // from then on (postMessage() above reaches it via a Handler). This
++    // fallback loop only exists so that code written for choc's other
++    // platforms (which do expect to be able to run()/stop() a loop) still
++    // links when built for Android.
++    struct FallbackRunLoop
++    {
++        std::mutex mutex;
++        std::condition_variable condition;
++        bool shouldStop = false;
++    };
++
++    inline FallbackRunLoop& getFallbackRunLoop()
++    {
++        static FallbackRunLoop loop;
++        return loop;
++    }
++}
++
++inline void run()
++{
++    initialise();
++
++    auto& loop = detail::getFallbackRunLoop();
++    std::unique_lock<std::mutex> l (loop.mutex);
++    loop.shouldStop = false;
++    loop.condition.wait (l, [&loop] { return loop.shouldStop; });
++}
++
++inline void stop()
++{
++    auto& loop = detail::getFallbackRunLoop();
++    std::lock_guard<std::mutex> l (loop.mutex);
++    loop.shouldStop = true;
++    loop.condition.notify_all();
++}
++
++struct Timer::Pimpl
++{
++    Pimpl (Callback&& c, uint32_t i) : callback (std::move (c)), interval (i)
++    {
++        getList().add (this);
++        scheduleNext();
++    }
++
++    ~Pimpl()
++    {
++        getList().remove (this);
++    }
++
++    void scheduleNext()
++    {
++        choc::android::postToMainThreadDelayed ([this] { staticCallback (this); }, interval);
++    }
++
++    static void staticCallback (Pimpl* context)
++    {
++        if (getList().invokeIfStillAlive (context))
++            context->scheduleNext();
++    }
++
++    Callback callback;
++    uint32_t interval;
++
++    struct TimerList
++    {
++        std::recursive_mutex lock;
++        std::unordered_set<Pimpl*> timers;
++
++        bool invokeIfStillAlive (Pimpl* p)
++        {
++            std::scoped_lock l (lock);
++
++            // must check before AND after the call because the Pimpl
++            // may be deleted during the callback
++            return timers.find (p) != timers.end()
++                    && p->callback()
++                    && timers.find (p) != timers.end();
++        }
++
++        void add (Pimpl* p)
++        {
++            std::scoped_lock l (lock);
++            timers.insert (p);
++        }
++
++        void remove (Pimpl* p)
++        {
++            std::scoped_lock l (lock);
++            timers.erase (p);
++        }
++    };
++
++    static TimerList& getList()
++    {
++        static TimerList list;
++        return list;
++    }
++};
++
+ //==============================================================================
+ #elif CHOC_APPLE
+ 
+diff --git a/choc/gui/choc_WebView.h b/choc/gui/choc_WebView.h
+index fcfdf42..32303ed 100644
+--- a/choc/gui/choc_WebView.h
++++ b/choc/gui/choc_WebView.h
+@@ -955,6 +955,173 @@ private:
+     static constexpr long WKUserScriptInjectionTimeAtDocumentStart = 0;
+ };
+ 
++//==============================================================================
++#elif CHOC_ANDROID
++
++#include <mutex>
++#include <atomic>
++
++#include "choc_AndroidWebViewJNI.h"
++
++struct choc::ui::WebView::Pimpl
++{
++    Pimpl (WebView& v, const Options& optionsToUse)
++        : owner (v), options (optionsToUse), fetchResource (options.fetchResource)
++    {
++    }
++
++    ~Pimpl()
++    {
++        deletionChecker->deleted = true;
++        nativeView.reset();
++    }
++
++    bool initialise()
++    {
++        defaultURI = getURIHome (options);
++
++        choc::android::NativeWebView::Callbacks callbacks;
++
++        callbacks.onPostMessage = [this] (const std::string& json)
++        {
++            owner.invokeBinding (json);
++        };
++
++        callbacks.onEvaluationResult = [this] (uint64_t token, const std::string& error, const std::string& json)
++        {
++            handleEvaluationResult (token, error, json);
++        };
++
++        if (fetchResource)
++            callbacks.fetchResource = [this] (const std::string& path) -> std::optional<choc::android::FetchedResource>
++            {
++                if (auto resource = fetchResource (path))
++                    return choc::android::FetchedResource { resource->data, resource->mimeType };
++
++                return {};
++            };
++
++        nativeView = std::make_unique<choc::android::NativeWebView> (std::move (callbacks));
++
++        if (! nativeView->isValid())
++            return false;
++
++        if (! options.customUserAgent.empty())
++            nativeView->setUserAgent (options.customUserAgent);
++
++        if (options.transparentBackground)
++            nativeView->setTransparentBackground (true);
++
++        if (options.fetchResource)
++            navigate ({});
++
++        if (options.webviewIsReady)
++            options.webviewIsReady (owner);
++
++        return true;
++    }
++
++    static constexpr const char* postMessageFn = "window.chocNative.postMessage";
++
++    bool stillInitialising() const  { return false; }
++    void* getViewHandle() const     { return nativeView != nullptr ? nativeView->getViewHandle() : nullptr; }
++
++    bool navigate (const std::string& url)
++    {
++        if (nativeView == nullptr)
++            return false;
++
++        nativeView->navigate (url.empty() ? defaultURI : url);
++        return true;
++    }
++
++    bool setHTML (const std::string& html)
++    {
++        if (nativeView == nullptr)
++            return false;
++
++        nativeView->loadHTML (html, {});
++        return true;
++    }
++
++    bool addInitScript (const std::string& script)
++    {
++        if (nativeView == nullptr)
++            return false;
++
++        nativeView->addInitScript (script);
++        return true;
++    }
++
++    bool evaluateJavascript (const std::string& script, CompletionHandler&& completionHandler)
++    {
++        if (nativeView == nullptr)
++            return false;
++
++        if (! completionHandler)
++        {
++            nativeView->evaluateJavascript (script, 0);
++            return true;
++        }
++
++        auto token = nextEvaluationToken.fetch_add (1) + 1;
++
++        {
++            std::scoped_lock l (pendingEvaluationsLock);
++            pendingEvaluations[token] = std::move (completionHandler);
++        }
++
++        nativeView->evaluateJavascript (script, token);
++        return true;
++    }
++
++    void handleEvaluationResult (uint64_t token, const std::string& error, const std::string& json)
++    {
++        CompletionHandler handler;
++
++        {
++            std::scoped_lock l (pendingEvaluationsLock);
++
++            if (auto found = pendingEvaluations.find (token); found != pendingEvaluations.end())
++            {
++                handler = std::move (found->second);
++                pendingEvaluations.erase (found);
++            }
++        }
++
++        if (handler == nullptr)
++            return;
++
++        choc::value::Value value;
++
++        if (error.empty() && ! json.empty())
++        {
++            try
++            {
++                value = choc::json::parseValue (json);
++            }
++            catch (const std::exception& e)
++            {
++                handler (e.what(), {});
++                return;
++            }
++        }
++
++        handler (error, value);
++    }
++
++    WebView& owner;
++    const Options options;
++    Options::FetchResource fetchResource;
++    std::string defaultURI;
++    std::unique_ptr<choc::android::NativeWebView> nativeView;
++    std::shared_ptr<DeletionChecker> deletionChecker { std::make_shared<DeletionChecker>() };
++
++    std::mutex pendingEvaluationsLock;
++    std::unordered_map<uint64_t, CompletionHandler> pendingEvaluations;
++    std::atomic<uint64_t> nextEvaluationToken { 0 };
++};
++
+ //==============================================================================
+ #elif CHOC_WINDOWS
+ 
+diff --git a/choc/platform/choc_AndroidJNIHelpers.h b/choc/platform/choc_AndroidJNIHelpers.h
+new file mode 100644
+index 0000000..85083f2
+--- /dev/null
++++ b/choc/platform/choc_AndroidJNIHelpers.h
+@@ -0,0 +1,305 @@
++//
++//    ██████ ██   ██  ██████   ██████
++//   ██      ██   ██ ██    ██ ██            ** Classy Header-Only Classes **
++//   ██      ███████ ██    ██ ██
++//   ██      ██   ██ ██    ██ ██           https://github.com/Tracktion/choc
++//    ██████ ██   ██  ██████   ██████
++//
++//   CHOC is (C)2022 Tracktion Corporation, and is offered under the terms of the ISC license:
++//
++//   Permission to use, copy, modify, and/or distribute this software for any purpose with or
++//   without fee is hereby granted, provided that the above copyright notice and this permission
++//   notice appear in all copies. THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
++//   WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
++//   AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR
++//   CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
++//   WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
++//   CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++
++#ifndef CHOC_ANDROID_JNI_HELPERS_HEADER_INCLUDED
++#define CHOC_ANDROID_JNI_HELPERS_HEADER_INCLUDED
++
++#include "choc_Platform.h"
++
++#if CHOC_ANDROID
++
++#include <jni.h>
++#include <string>
++#include <atomic>
++#include <mutex>
++
++#include "choc_Assert.h"
++
++//==============================================================================
++/**
++    This namespace contains the only place in choc that is allowed to touch the
++    Android JNI API directly. Every other choc header that needs to reach the
++    JVM (e.g. choc::ui::WebView's Android backend) goes through the plain C++
++    entry points declared here, so that all the JNI boilerplate and lifetime
++    bookkeeping lives in one place.
++
++    Before any choc code that needs the JVM can be used (e.g. constructing a
++    choc::ui::WebView), the hosting application must call
++    choc::android::initialise() exactly once, normally from JNI_OnLoad() or
++    from the application's earliest Java-called native entry point, passing
++    the JavaVM and an application Context (an Activity or the Application
++    object both work).
++*/
++namespace choc::android
++{
++
++//==============================================================================
++/// Stores the JavaVM and application Context that the rest of choc's Android
++/// support relies on. Must be called once, before any other choc::android or
++/// choc::ui::WebView functionality is used.
++inline void initialise (JavaVM* vm, jobject applicationContext);
++
++/// Returns the JavaVM passed to initialise(), or nullptr if it hasn't been called yet.
++inline JavaVM* getJavaVM();
++
++/// Returns the application Context passed to initialise() (as a global reference),
++/// or nullptr if it hasn't been called yet.
++inline jobject getApplicationContext();
++
++/// Returns the JNIEnv for the calling thread, attaching the thread to the JVM
++/// first if necessary. Threads that get attached by this call are automatically
++/// detached again when they exit.
++inline JNIEnv* getEnv();
++
++/// Looks up a class by its JNI name (e.g. "com/tracktion/choc/gui/ChocWebView").
++/// This first tries the normal JNIEnv::FindClass(), then falls back to asking
++/// the application Context's own ClassLoader, since FindClass() can't see
++/// application classes when called from a thread that wasn't created by the JVM.
++inline jclass findClass (JNIEnv&, const char* jniClassName);
++
++/// Converts a jstring to a std::string. Handles a null jstring by returning {}.
++inline std::string toString (JNIEnv&, jstring);
++
++/// Creates a local-ref jstring from a std::string.
++inline jstring toJString (JNIEnv&, const std::string&);
++
++/// Returns true and clears the exception if the calling thread has a pending
++/// Java exception (and prints a description of it via ExceptionDescribe() to
++/// help with debugging). Should be called after any JNI call that might throw.
++inline bool checkAndClearException (JNIEnv&);
++
++//==============================================================================
++/// A simple RAII wrapper for a JNI local reference, so it gets deleted
++/// automatically rather than having to rely on the JNI local-ref frame.
++template <typename JNIType>
++struct LocalRef
++{
++    LocalRef() = default;
++    explicit LocalRef (JNIType r) : ref (r) {}
++    LocalRef (const LocalRef&) = delete;
++    LocalRef (LocalRef&& other) noexcept : ref (other.ref)  { other.ref = {}; }
++
++    LocalRef& operator= (LocalRef&& other) noexcept
++    {
++        reset();
++        ref = other.ref;
++        other.ref = {};
++        return *this;
++    }
++
++    ~LocalRef()  { reset(); }
++
++    void reset()
++    {
++        if (ref != nullptr)
++        {
++            getEnv()->DeleteLocalRef (ref);
++            ref = {};
++        }
++    }
++
++    JNIType get() const noexcept        { return ref; }
++    operator JNIType() const noexcept   { return ref; }
++    explicit operator bool() const      { return ref != nullptr; }
++
++    JNIType ref = {};
++};
++
++/// A simple RAII wrapper for a JNI global reference.
++template <typename JNIType>
++struct GlobalRef
++{
++    GlobalRef() = default;
++
++    explicit GlobalRef (JNIType local)
++    {
++        if (local != nullptr)
++            ref = static_cast<JNIType> (getEnv()->NewGlobalRef (local));
++    }
++
++    GlobalRef (const GlobalRef&) = delete;
++    GlobalRef (GlobalRef&& other) noexcept : ref (other.ref)  { other.ref = {}; }
++
++    GlobalRef& operator= (GlobalRef&& other) noexcept
++    {
++        reset();
++        ref = other.ref;
++        other.ref = {};
++        return *this;
++    }
++
++    ~GlobalRef()  { reset(); }
++
++    void reset()
++    {
++        if (ref != nullptr)
++        {
++            getEnv()->DeleteGlobalRef (ref);
++            ref = {};
++        }
++    }
++
++    JNIType get() const noexcept        { return ref; }
++    operator JNIType() const noexcept   { return ref; }
++    explicit operator bool() const      { return ref != nullptr; }
++
++    JNIType ref = {};
++};
++
++
++//==============================================================================
++//        _        _           _  _
++//     __| |  ___ | |_   __ _ (_)| | ___
++//    / _` | / _ \| __| / _` || || |/ __|
++//   | (_| ||  __/| |_ | (_| || || |\__ \ _  _  _
++//    \__,_| \___| \__| \__,_||_||_||___/(_)(_)(_)
++//
++//   Code beyond this point is implementation detail...
++//
++//==============================================================================
++
++inline JavaVM*& getJavaVMRef()
++{
++    static JavaVM* vm = nullptr;
++    return vm;
++}
++
++inline GlobalRef<jobject>& getApplicationContextRef()
++{
++    static GlobalRef<jobject> context;
++    return context;
++}
++
++inline void initialise (JavaVM* vm, jobject applicationContext)
++{
++    getJavaVMRef() = vm;
++
++    JNIEnv* env = nullptr;
++    vm->GetEnv (reinterpret_cast<void**> (&env), JNI_VERSION_1_6);
++    CHOC_ASSERT (env != nullptr); // initialise() must be called on a thread that's already attached to the JVM
++
++    getApplicationContextRef() = GlobalRef<jobject> (applicationContext);
++}
++
++inline JavaVM* getJavaVM()
++{
++    return getJavaVMRef();
++}
++
++inline jobject getApplicationContext()
++{
++    return getApplicationContextRef().get();
++}
++
++inline JNIEnv* getEnv()
++{
++    struct ThreadAttachment
++    {
++        ~ThreadAttachment()
++        {
++            if (attachedByUs)
++                if (auto vm = getJavaVMRef())
++                    vm->DetachCurrentThread();
++        }
++
++        bool attachedByUs = false;
++    };
++
++    static thread_local ThreadAttachment attachment;
++
++    auto vm = getJavaVMRef();
++    CHOC_ASSERT (vm != nullptr); // you must call choc::android::initialise() before using any JNI-dependent choc functionality
++
++    JNIEnv* env = nullptr;
++
++    if (vm->GetEnv (reinterpret_cast<void**> (&env), JNI_VERSION_1_6) == JNI_EDETACHED)
++    {
++        JavaVMAttachArgs args { JNI_VERSION_1_6, "choc", nullptr };
++
++        if (vm->AttachCurrentThread (&env, &args) == JNI_OK)
++            attachment.attachedByUs = true;
++    }
++
++    return env;
++}
++
++inline bool checkAndClearException (JNIEnv& env)
++{
++    if (env.ExceptionCheck())
++    {
++        env.ExceptionDescribe();
++        env.ExceptionClear();
++        return true;
++    }
++
++    return false;
++}
++
++inline jclass findClass (JNIEnv& env, const char* jniClassName)
++{
++    if (auto direct = env.FindClass (jniClassName))
++        return direct;
++
++    env.ExceptionClear();
++
++    // Fall back to going via the application Context's ClassLoader, which is
++    // needed when this is called from a thread that wasn't created by the JVM
++    // (a common case for choc's own worker threads).
++    auto context = getApplicationContext();
++    CHOC_ASSERT (context != nullptr); // did you forget to call choc::android::initialise()?
++
++    LocalRef<jclass> contextClass (env.GetObjectClass (context));
++    auto getClassLoaderMethod = env.GetMethodID (contextClass, "getClassLoader", "()Ljava/lang/ClassLoader;");
++    LocalRef<jobject> classLoader (env.CallObjectMethod (context, getClassLoaderMethod));
++
++    LocalRef<jclass> classLoaderClass (env.FindClass ("java/lang/ClassLoader"));
++    auto loadClassMethod = env.GetMethodID (classLoaderClass, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
++
++    std::string dottedName = jniClassName;
++
++    for (auto& c : dottedName)
++        if (c == '/')
++            c = '.';
++
++    LocalRef<jstring> nameString (toJString (env, dottedName));
++    auto result = static_cast<jclass> (env.CallObjectMethod (classLoader, loadClassMethod, nameString.get()));
++    checkAndClearException (env);
++    return result;
++}
++
++inline std::string toString (JNIEnv& env, jstring s)
++{
++    if (s == nullptr)
++        return {};
++
++    auto length = static_cast<size_t> (env.GetStringUTFLength (s));
++    auto chars = env.GetStringUTFChars (s, nullptr);
++    std::string result (chars, length);
++    env.ReleaseStringUTFChars (s, chars);
++    return result;
++}
++
++inline jstring toJString (JNIEnv& env, const std::string& s)
++{
++    return env.NewStringUTF (s.c_str());
++}
++
++} // namespace choc::android
++
++#endif // CHOC_ANDROID
++#endif // CHOC_ANDROID_JNI_HELPERS_HEADER_INCLUDED
+diff --git a/choc/platform/choc_AndroidMainThread.h b/choc/platform/choc_AndroidMainThread.h
+new file mode 100644
+index 0000000..3948fb8
+--- /dev/null
++++ b/choc/platform/choc_AndroidMainThread.h
+@@ -0,0 +1,127 @@
++//
++//    ██████ ██   ██  ██████   ██████
++//   ██      ██   ██ ██    ██ ██            ** Classy Header-Only Classes **
++//   ██      ███████ ██    ██ ██
++//   ██      ██   ██ ██    ██ ██           https://github.com/Tracktion/choc
++//    ██████ ██   ██  ██████   ██████
++//
++//   CHOC is (C)2022 Tracktion Corporation, and is offered under the terms of the ISC license:
++//
++//   Permission to use, copy, modify, and/or distribute this software for any purpose with or
++//   without fee is hereby granted, provided that the above copyright notice and this permission
++//   notice appear in all copies. THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
++//   WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
++//   AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR
++//   CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
++//   WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
++//   CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++
++#ifndef CHOC_ANDROID_MAIN_THREAD_HEADER_INCLUDED
++#define CHOC_ANDROID_MAIN_THREAD_HEADER_INCLUDED
++
++#include "choc_Platform.h"
++
++#if CHOC_ANDROID
++
++#include <functional>
++#include <memory>
++#include <cstdint>
++
++#include "choc_AndroidJNIHelpers.h"
++
++//==============================================================================
++/**
++    Lets native code post a function to be run asynchronously on Android's
++    main (UI) thread, via a tiny companion Java class (com.tracktion.choc.ChocMainThread)
++    that wraps android.os.Handler.
++
++    choc::messageloop::postMessage() and choc::messageloop::Timer both use this
++    (see choc_MessageLoop.h) - this is the only other place besides
++    choc_AndroidWebViewJNI.h that touches Android's JNI API directly.
++*/
++namespace choc::android
++{
++
++/// Posts a function to be invoked asynchronously on Android's main thread.
++inline void postToMainThread (std::function<void()>&& fn);
++
++/// Like postToMainThread(), but only invokes the function after the given delay.
++inline void postToMainThreadDelayed (std::function<void()>&& fn, uint32_t delayMillis);
++
++
++//==============================================================================
++//        _        _           _  _
++//     __| |  ___ | |_   __ _ (_)| | ___
++//    / _` | / _ \| __| / _` || || |/ __|
++//   | (_| ||  __/| |_ | (_| || || |\__ \ _  _  _
++//    \__,_| \___| \__| \__,_||_||_||___/(_)(_)(_)
++//
++//   Code beyond this point is implementation detail...
++//
++//==============================================================================
++
++namespace detail
++{
++    struct MainThreadBindings
++    {
++        jclass dispatcherClass = {};
++        jmethodID postMethod = {};
++        jmethodID postDelayedMethod = {};
++    };
++
++    inline void JNICALL nativeDispatch (JNIEnv*, jclass, jlong token)
++    {
++        std::unique_ptr<std::function<void()>> fn (reinterpret_cast<std::function<void()>*> (token));
++        (*fn)();
++    }
++
++    inline MainThreadBindings& getMainThreadBindings()
++    {
++        static MainThreadBindings bindings = []
++        {
++            auto& env = *getEnv();
++            MainThreadBindings b;
++
++            auto localClass = findClass (env, "com/tracktion/choc/ChocMainThread");
++            b.dispatcherClass = static_cast<jclass> (env.NewGlobalRef (localClass));
++            env.DeleteLocalRef (localClass);
++
++            b.postMethod        = env.GetStaticMethodID (b.dispatcherClass, "post", "(J)V");
++            b.postDelayedMethod = env.GetStaticMethodID (b.dispatcherClass, "postDelayed", "(JJ)V");
++
++            JNINativeMethod methods[] =
++            {
++                { const_cast<char*> ("nativeDispatch"), const_cast<char*> ("(J)V"), reinterpret_cast<void*> (&nativeDispatch) }
++            };
++
++            env.RegisterNatives (b.dispatcherClass, methods, 1);
++            checkAndClearException (env);
++            return b;
++        }();
++
++        return bindings;
++    }
++}
++
++inline void postToMainThread (std::function<void()>&& fn)
++{
++    auto& env = *getEnv();
++    auto& bindings = detail::getMainThreadBindings();
++    auto token = reinterpret_cast<jlong> (new std::function<void()> (std::move (fn)));
++    env.CallStaticVoidMethod (bindings.dispatcherClass, bindings.postMethod, token);
++    checkAndClearException (env);
++}
++
++inline void postToMainThreadDelayed (std::function<void()>&& fn, uint32_t delayMillis)
++{
++    auto& env = *getEnv();
++    auto& bindings = detail::getMainThreadBindings();
++    auto token = reinterpret_cast<jlong> (new std::function<void()> (std::move (fn)));
++    env.CallStaticVoidMethod (bindings.dispatcherClass, bindings.postDelayedMethod, token, static_cast<jlong> (delayMillis));
++    checkAndClearException (env);
++}
++
++} // namespace choc::android
++
++#endif // CHOC_ANDROID
++#endif // CHOC_ANDROID_MAIN_THREAD_HEADER_INCLUDED
+diff --git a/choc/platform/choc_Execute.h b/choc/platform/choc_Execute.h
+index 707c009..fedbe39 100644
+--- a/choc/platform/choc_Execute.h
++++ b/choc/platform/choc_Execute.h
+@@ -103,6 +103,14 @@ inline ProcessResult execute (std::string command, bool alsoReadStdErr)
+ 
+     std::ostringstream result;
+ 
++    // `handle` is non-null here (checked above), but some C libraries (e.g. Android's
++    // bionic) annotate fread()/pclose()'s FILE* parameter as _Nonnull, which trips
++    // Clang's nullability checker even though this pointer plainly can't be null.
++   #if defined (__clang__)
++    #pragma clang diagnostic push
++    #pragma clang diagnostic ignored "-Wnullable-to-nonnull-conversion"
++   #endif
++
+     for (;;)
+     {
+         char buffer[1024];
+@@ -123,6 +131,11 @@ inline ProcessResult execute (std::string command, bool alsoReadStdErr)
+    #else
+     auto status = ::pclose (handle);
+    #endif
++
++   #if defined (__clang__)
++    #pragma clang diagnostic pop
++   #endif
++
+     return { result.str(), status };
+ }
+ 

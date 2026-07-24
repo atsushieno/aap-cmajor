@@ -1,0 +1,9 @@
+<plugins xmlns="urn:org.androidaudioplugin.core">
+  <plugin name="AAP Cmajor Sample" category="Effect" developer="AAP Developers"
+      unique-id="urn:org.androidaudioplugin/samples/cmajor/AAPCMajorSample"
+      library="libaap-cmajor-sample.so"
+      gui:ui-view-factory="org.androidaudioplugin.ui.compose.ComposeAudioPluginViewFactory"
+      xmlns:gui="urn://androidaudioplugin.org/extensions/gui">
+    <extensions bom="0.12.0" />
+  </plugin>
+</plugins>

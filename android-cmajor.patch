@@ -1,0 +1,503 @@
+diff --git a/modules/CMakeLists.txt b/modules/CMakeLists.txt
+index d798a19..9aeca55 100644
+--- a/modules/CMakeLists.txt
++++ b/modules/CMakeLists.txt
+@@ -82,6 +82,8 @@ function (MAKE_CMAJ_LIBRARY)
+     elseif (${CMAKE_SYSTEM_NAME} MATCHES "Android")
+         if (${CMAKE_SYSTEM_PROCESSOR} MATCHES "aarch64")
+             set (LLVM_PATH_ROOT ${LLVM_RELEASE_DIR}/android/arm64)
++        elseif (${CMAKE_SYSTEM_PROCESSOR} MATCHES "x86_64")
++            set (LLVM_PATH_ROOT ${LLVM_RELEASE_DIR}/android/x64)
+         endif()
+         set (LLVM_EXTRA_LIBS z)
+     elseif (${CMAKE_SYSTEM_NAME} MATCHES "Windows")
+@@ -439,6 +441,25 @@ function (MAKE_CMAJ_LIBRARY)
+             ${CHOC_TARGET}
+     )
+ 
++    if (${CMAKE_SYSTEM_NAME} MATCHES "Android")
++        # The Android NDK's linker (lld) uses --gc-sections by default, which strips the
++        # object files inside LLVM's target-description static libraries that only exist to
++        # run self-registering static initializers (they register each CPU/feature with
++        # LLVM's TargetRegistry, but are never directly referenced by symbol name from
++        # anywhere else). Without those, LLVM's TargetMachine can't recognise the host CPU
++        # or any of its features at runtime ("'cortex-a78' is not a recognized processor for
++        # this target"), and falls back to a subtarget that doesn't support 64-bit codegen at
++        # all ("LLVM ERROR: 64-bit code requested on a subtarget that doesn't support it!").
++        # Forcing --whole-archive for just the platform codegen libs (LLVM*Info/Desc/etc.)
++        # keeps those initializers in the final binary.
++        target_link_libraries (${CMAJ_LIBRARY_NAME}
++            PRIVATE
++                "-Wl,--whole-archive"
++                ${LLVM_PLATFORM_LIBS}
++                "-Wl,--no-whole-archive"
++        )
++    endif()
++
+     if (CMAJ_INCLUDE_SCRIPTING)
+         if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
+             find_package(PkgConfig REQUIRED)
+diff --git a/modules/compiler/src/backends/LLVM/cmaj_LLVMGenerator.h b/modules/compiler/src/backends/LLVM/cmaj_LLVMGenerator.h
+index 412a446..5d0754a 100644
+--- a/modules/compiler/src/backends/LLVM/cmaj_LLVMGenerator.h
++++ b/modules/compiler/src/backends/LLVM/cmaj_LLVMGenerator.h
+@@ -320,6 +320,17 @@ struct LLVMCodeGenerator
+             opts.ExceptionModel = ::llvm::ExceptionHandling::None;
+             opts.setFPDenormalMode (::llvm::DenormalMode::getPositiveZero());
+ 
++           #ifdef __ANDROID__
++            // detectHost() identifies the running CPU (e.g. "cortex-a78" plus feature bits
++            // like sha2/lse/neon), but the AArch64 target's own subtarget tables in our
++            // bundled Android LLVM build don't recognise those names, so they get silently
++            // ignored - leaving a subtarget that doesn't support 64-bit codegen at all
++            // ("LLVM ERROR: 64-bit code requested on a subtarget that doesn't support it!").
++            // Fall back to a generic baseline CPU with no extra features on this platform.
++            machineBuilder->setCPU ("generic");
++            machineBuilder->getFeatures() = ::llvm::SubtargetFeatures();
++           #endif
++
+             machineBuilder->setCodeGenOptLevel (getCodeGenOptLevel (buildSettings.getOptimisationLevel()));
+ 
+             if (auto tm = machineBuilder->createTargetMachine())
+diff --git a/modules/compiler/src/backends/LLVM/cmaj_LLVMPerformer.cpp b/modules/compiler/src/backends/LLVM/cmaj_LLVMPerformer.cpp
+index bdd0b4d..0c78655 100644
+--- a/modules/compiler/src/backends/LLVM/cmaj_LLVMPerformer.cpp
++++ b/modules/compiler/src/backends/LLVM/cmaj_LLVMPerformer.cpp
+@@ -196,6 +196,18 @@ struct LLJITHolder
+             opts.setFPDenormalMode (::llvm::DenormalMode::getPositiveZero());
+             opts.setFP32DenormalMode (::llvm::DenormalMode::getPositiveZero());
+ 
++           #ifdef __ANDROID__
++            // detectHost() asks LLVM's Support library to identify the running CPU (e.g.
++            // "cortex-a78" plus feature bits like sha2/lse/neon), but the AArch64 target's
++            // own subtarget tables in our bundled Android LLVM build don't recognise those
++            // names, so every one of them gets silently ignored - leaving a subtarget that
++            // doesn't even support 64-bit codegen ("LLVM ERROR: 64-bit code requested on a
++            // subtarget that doesn't support it!"). Fall back to a generic baseline CPU with
++            // no extra features instead of trusting the host detection on this platform.
++            machineBuilder->setCPU ("generic");
++            machineBuilder->getFeatures() = ::llvm::SubtargetFeatures();
++           #endif
++
+             machineBuilder->setCodeGenOptLevel (getCodeGenOptLevel (optimisationLevel));
+ 
+             ::llvm::orc::LLJITBuilder builder;
+@@ -846,6 +858,12 @@ std::string generateAssembler (const cmaj::ProgramInterface& p,
+             opts.ExceptionModel = ::llvm::ExceptionHandling::None;
+             opts.setFPDenormalMode (::llvm::DenormalMode::getPositiveZero());
+ 
++           #ifdef __ANDROID__
++            // see the matching comment in LLJITHolder's constructor above.
++            machineBuilder->setCPU ("generic");
++            machineBuilder->getFeatures() = ::llvm::SubtargetFeatures();
++           #endif
++
+             machineBuilder->setCodeGenOptLevel (LLVMCodeGenerator::getCodeGenOptLevel (buildSettings.getOptimisationLevel()));
+ 
+             if (auto t = machineBuilder->createTargetMachine())
+diff --git a/modules/plugin/CMakeLists.txt b/modules/plugin/CMakeLists.txt
+index 8e7a987..29323d4 100644
+--- a/modules/plugin/CMakeLists.txt
++++ b/modules/plugin/CMakeLists.txt
+@@ -4,4 +4,8 @@ set(CMAJ_INCLUDE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../cmajor/include")
+ set(CLAP_INCLUDE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../3rdParty/clap/include")
+ 
+ add_subdirectory(include/common)
+-add_subdirectory(include/clap)
+\ No newline at end of file
++add_subdirectory(include/clap)
++
++if (${CMAKE_SYSTEM_NAME} MATCHES "Android")
++    add_subdirectory(include/aap)
++endif()
+\ No newline at end of file
+diff --git a/modules/plugin/include/aap/CMakeLists.txt b/modules/plugin/include/aap/CMakeLists.txt
+new file mode 100644
+index 0000000..78465ef
+--- /dev/null
++++ b/modules/plugin/include/aap/CMakeLists.txt
+@@ -0,0 +1,29 @@
++cmake_minimum_required(VERSION 3.16..3.22)
++
++# Experimental Android Audio Plugin (AAP) backend for cmajor - see cmaj_AAPPlugin.cpp.
++# This only makes sense (and only gets configured) when building for Android, since it
++# depends on the androidaudioplugin prefab package.
++
++find_package (androidaudioplugin REQUIRED CONFIG)
++
++MAKE_CMAJ_LIBRARY (
++    LIBRARY_NAME aap_cmajor_engine_lib
++    INCLUDE_PLAYBACK
++    ENABLE_PERFORMER_LLVM
++)
++
++add_library(aap-cmajor-sample SHARED
++    cmaj_AAPPlugin.cpp
++)
++
++target_compile_features(aap-cmajor-sample PRIVATE cxx_std_17)
++
++target_link_libraries(aap-cmajor-sample
++    PRIVATE
++        aap_cmajor_engine_lib
++        cmaj_clap
++        androidaudioplugin::androidaudioplugin
++        android
++        log
++        ${CMAKE_DL_LIBS}
++)
+diff --git a/modules/plugin/include/aap/cmaj_AAPPlugin.cpp b/modules/plugin/include/aap/cmaj_AAPPlugin.cpp
+new file mode 100644
+index 0000000..2ba204f
+--- /dev/null
++++ b/modules/plugin/include/aap/cmaj_AAPPlugin.cpp
+@@ -0,0 +1,349 @@
++//
++//     ,ad888ba,                              88
++//    d8"'    "8b
++//   d8            88,dba,,adba,   ,aPP8A.A8  88     The Cmajor Toolkit
++//   Y8,           88    88    88  88     88  88
++//    Y8a.   .a8P  88    88    88  88,   ,88  88     (C)2024 Cmajor Software Ltd
++//     '"Y888Y"'   88    88    88  '"8bbP"Y8  88     https://cmajor.dev
++//                                           ,88
++//                                        888P"
++//
++//  The Cmajor project is subject to commercial or open-source licensing.
++//  You may use it under the terms of the GPLv3 (see www.gnu.org/licenses), or
++//  visit https://cmajor.dev to learn about our commercial licence options.
++//
++//  CMAJOR IS PROVIDED "AS IS" WITHOUT ANY WARRANTY, AND ALL WARRANTIES, WHETHER
++//  EXPRESSED OR IMPLIED, INCLUDING MERCHANTABILITY AND FITNESS FOR PURPOSE, ARE
++//  DISCLAIMED.
++
++// This is an experimental Android Audio Plugin (AAP) backend for cmajor.
++//
++// Rather than a new cmajor performer backend, it's a thin adapter that hosts the
++// existing cmaj::plugin::clap::create() CLAP plugin (see ../clap/cmaj_CLAPPlugin.h)
++// inside AAP's C plugin ABI (see aap/android-audio-plugin.h). CLAP and AAP are both
++// plain C, struct-of-function-pointers plugin ABIs, so the two map onto each other
++// fairly directly - prepare/activate/process/deactivate on the AAP side become
++// activate/start_processing/process/stop_processing on the CLAP side.
++//
++// This first cut proves out the path end-to-end with a small embedded stereo gain
++// patch, run by cmajor's JIT engine at runtime (no ahead-of-time codegen needed).
++// It only handles audio ports - no MIDI, no host-side parameter automation, no
++// state save/load and no GUI yet.
++
++#include "../clap/cmaj_CLAPPlugin.h"
++
++#include <aap/android-audio-plugin.h>
++
++#include <array>
++#include <cstring>
++#include <memory>
++
++namespace cmaj::plugin::aap
++{
++
++//==============================================================================
++// A tiny embedded cmajor patch, just enough to prove out the AAP <-> CLAP <-> cmajor
++// path: a stereo gain effect with one parameter (not yet exposed to the AAP host).
++static constexpr const char* manifestSource = R"({
++    "CmajorVersion": 1,
++    "ID": "dev.cmajor.aap.sample.gain",
++    "version": "1.0",
++    "name": "AAP Cmajor Sample",
++    "description": "An experimental cmajor-powered Android Audio Plugin",
++    "category": "effect",
++    "manufacturer": "Cmajor",
++    "isInstrument": false,
++    "source": ["sample.cmajor"]
++})";
++
++static constexpr const char* cmajorSource = R"(
++    graph Gain  [[ main ]]
++    {
++        input stream float32<2> in;
++        output stream float32<2> out;
++
++        input value float32 gain  [[ name: "Gain", min: 0, max: 1, init: 0.75 ]];
++
++        connection in * gain -> out;
++    }
++)";
++
++inline cmaj::plugin::Environment createEnvironment()
++{
++    auto readFile = [] (const std::filesystem::path& path) -> std::unique_ptr<std::istream>
++    {
++        if (path == "sample.cmajorpatch")
++            return std::make_unique<std::istringstream> (std::string (manifestSource), std::ios::binary);
++
++        if (path == "sample.cmajor")
++            return std::make_unique<std::istringstream> (std::string (cmajorSource), std::ios::binary);
++
++        return {};
++    };
++
++    auto fileExists = [] (const std::filesystem::path& path)
++    {
++        return path == "sample.cmajorpatch" || path == "sample.cmajor";
++    };
++
++    return
++    {
++        cmaj::plugin::Environment::EngineType::JIT,
++        [] { return cmaj::Engine::create(); },
++        cmaj::plugin::Environment::VirtualFileSystem
++        {
++            readFile,
++            [] (const std::filesystem::path& path) { return path; },
++            [] (const std::filesystem::path&) -> std::filesystem::file_time_type { return {}; },
++            fileExists
++        }
++    };
++}
++
++//==============================================================================
++// A minimal CLAP host. This wrapper doesn't (yet) forward any of the host-side CLAP
++// extensions through to the AAP host, so these are all no-ops for now.
++struct Host  : public clap_host_t
++{
++    Host()
++    {
++        clap_version = CLAP_VERSION;
++        host_data = nullptr;
++        name = "AAP";
++        vendor = "cmajor";
++        url = "";
++        version = "0.1";
++        get_extension    = [] (const clap_host_t*, const char*) -> const void* { return nullptr; };
++        request_restart  = [] (const clap_host_t*) {};
++        request_process  = [] (const clap_host_t*) {};
++        request_callback = [] (const clap_host_t*) {};
++    }
++};
++
++inline clap_input_events_t createEmptyInputEventQueue()
++{
++    return
++    {
++        nullptr,
++        [] (const clap_input_events_t*) -> uint32_t { return 0; },
++        [] (const clap_input_events_t*, uint32_t) -> const clap_event_header_t* { return nullptr; }
++    };
++}
++
++//==============================================================================
++struct Wrapper
++{
++    Wrapper()
++        : plugin (cmaj::plugin::clap::create (descriptor, host, "sample.cmajorpatch", createEnvironment()))
++    {
++        if (plugin != nullptr)
++            initialised = plugin->init (plugin.get());
++    }
++
++    ~Wrapper()
++    {
++        if (plugin == nullptr)
++            return;
++
++        if (processing)
++            plugin->stop_processing (plugin.get());
++
++        if (active)
++            plugin->deactivate (plugin.get());
++    }
++
++    bool isValid() const  { return plugin != nullptr && initialised; }
++
++    Host host;
++    const clap_plugin_descriptor_t descriptor {};
++    cmaj::plugin::clap::PluginPtr plugin;
++
++    bool initialised = false;
++    bool active = false;
++    bool processing = false;
++};
++
++//==============================================================================
++// Port layout: this wrapper declares its own fixed ports (below, via aapGetPluginInfo)
++// rather than relying on ports declared in aap_metadata.xml, so these indices are
++// entirely under our control and always match what the host will ask for.
++enum Port : uint32_t
++{
++    audioInLeft   = 0,
++    audioInRight  = 1,
++    audioOutLeft  = 2,
++    audioOutRight = 3,
++    numPorts      = 4
++};
++
++struct PortInfo
++{
++    uint32_t index;
++    const char* name;
++};
++
++static constexpr PortInfo ports[] =
++{
++    { Port::audioInLeft,   "Audio In L" },
++    { Port::audioInRight,  "Audio In R" },
++    { Port::audioOutLeft,  "Audio Out L" },
++    { Port::audioOutRight, "Audio Out R" },
++};
++
++void aapPrepare (AndroidAudioPlugin* plugin, int32_t sampleRate, aap_buffer_t* buffer)
++{
++    auto& wrapper = *static_cast<Wrapper*> (plugin->plugin_specific);
++
++    if (wrapper.active)
++    {
++        if (wrapper.processing)
++        {
++            wrapper.plugin->stop_processing (wrapper.plugin.get());
++            wrapper.processing = false;
++        }
++
++        wrapper.plugin->deactivate (wrapper.plugin.get());
++        wrapper.active = false;
++    }
++
++    auto maxFrames = static_cast<uint32_t> (buffer->num_frames (buffer));
++
++    wrapper.active = wrapper.plugin->activate (wrapper.plugin.get(), static_cast<double> (sampleRate), 1, maxFrames);
++}
++
++void aapActivate (AndroidAudioPlugin* plugin)
++{
++    auto& wrapper = *static_cast<Wrapper*> (plugin->plugin_specific);
++
++    if (wrapper.active && ! wrapper.processing)
++        wrapper.processing = wrapper.plugin->start_processing (wrapper.plugin.get());
++}
++
++void aapProcess (AndroidAudioPlugin* plugin, aap_buffer_t* buffer, int32_t frameCount, int64_t)
++{
++    auto& wrapper = *static_cast<Wrapper*> (plugin->plugin_specific);
++
++    if (! wrapper.processing)
++        return;
++
++    std::array<float*, 2> inChannels
++    {
++        static_cast<float*> (buffer->get_buffer (buffer, Port::audioInLeft)),
++        static_cast<float*> (buffer->get_buffer (buffer, Port::audioInRight))
++    };
++
++    std::array<float*, 2> outChannels
++    {
++        static_cast<float*> (buffer->get_buffer (buffer, Port::audioOutLeft)),
++        static_cast<float*> (buffer->get_buffer (buffer, Port::audioOutRight))
++    };
++
++    clap_audio_buffer_t inputs  { inChannels.data(),  nullptr, 2, 0, 0 };
++    clap_audio_buffer_t outputs { outChannels.data(), nullptr, 2, 0, 0 };
++
++    auto emptyEvents = createEmptyInputEventQueue();
++
++    const clap_process_t process
++    {
++        -1,
++        static_cast<uint32_t> (frameCount),
++        nullptr,
++        std::addressof (inputs),
++        std::addressof (outputs),
++        1,
++        1,
++        std::addressof (emptyEvents),
++        nullptr
++    };
++
++    wrapper.plugin->process (wrapper.plugin.get(), std::addressof (process));
++}
++
++void aapDeactivate (AndroidAudioPlugin* plugin)
++{
++    auto& wrapper = *static_cast<Wrapper*> (plugin->plugin_specific);
++
++    if (wrapper.processing)
++    {
++        wrapper.plugin->stop_processing (wrapper.plugin.get());
++        wrapper.processing = false;
++    }
++}
++
++void* aapGetExtension (AndroidAudioPlugin*, const char*)
++{
++    return nullptr;
++}
++
++aap_plugin_info_t aapGetPluginInfo (AndroidAudioPlugin*)
++{
++    aap_plugin_info_t info {};
++
++    info.plugin_package_name = [] (aap_plugin_info_t*) -> const char* { return "org.androidaudioplugin.ports.cmajor"; };
++    info.plugin_local_name   = [] (aap_plugin_info_t*) -> const char* { return "AAPCMajorSample"; };
++    info.display_name        = [] (aap_plugin_info_t*) -> const char* { return "AAP Cmajor Sample"; };
++    info.developer_name      = [] (aap_plugin_info_t*) -> const char* { return "AAP Developers"; };
++    info.version             = [] (aap_plugin_info_t*) -> const char* { return "0.1"; };
++    info.primary_category    = [] (aap_plugin_info_t*) -> const char* { return "Effect"; };
++    info.identifier_string   = [] (aap_plugin_info_t*) -> const char* { return "urn:org.androidaudioplugin/samples/cmajor/AAPCMajorSample"; };
++    info.plugin_id           = [] (aap_plugin_info_t*) -> const char* { return "urn:org.androidaudioplugin/samples/cmajor/AAPCMajorSample"; };
++
++    info.get_port_count = [] (aap_plugin_info_t*) -> uint32_t { return static_cast<uint32_t> (Port::numPorts); };
++
++    info.get_port = [] (aap_plugin_info_t*, uint32_t index) -> aap_plugin_info_port_t
++    {
++        aap_plugin_info_port_t port {};
++        port.context = const_cast<PortInfo*> (std::addressof (ports[index]));
++        port.index = [] (aap_plugin_info_port_t* p) -> uint32_t { return static_cast<PortInfo*> (p->context)->index; };
++        port.name = [] (aap_plugin_info_port_t* p) -> const char* { return static_cast<PortInfo*> (p->context)->name; };
++        port.content_type = [] (aap_plugin_info_port_t*) -> aap_content_type { return AAP_CONTENT_TYPE_AUDIO; };
++
++        port.direction = [] (aap_plugin_info_port_t* p) -> aap_port_direction
++        {
++            auto index = static_cast<PortInfo*> (p->context)->index;
++            return index == Port::audioInLeft || index == Port::audioInRight ? AAP_PORT_DIRECTION_INPUT
++                                                                              : AAP_PORT_DIRECTION_OUTPUT;
++        };
++
++        return port;
++    };
++
++    info.get_parameter_count = [] (aap_plugin_info_t*) -> uint32_t { return 0; };
++    info.get_parameter = [] (aap_plugin_info_t*, uint32_t) -> aap_plugin_info_parameter_t { return {}; };
++
++    return info;
++}
++
++AndroidAudioPlugin* aapInstantiate (AndroidAudioPluginFactory*, const char*, AndroidAudioPluginHost*)
++{
++    auto wrapper = std::make_unique<Wrapper>();
++
++    if (! wrapper->isValid())
++        return nullptr;
++
++    return new AndroidAudioPlugin
++    {
++        wrapper.release(),
++        aapPrepare,
++        aapActivate,
++        aapProcess,
++        aapDeactivate,
++        aapGetExtension,
++        aapGetPluginInfo
++    };
++}
++
++void aapRelease (AndroidAudioPluginFactory*, AndroidAudioPlugin* instance)
++{
++    delete static_cast<Wrapper*> (instance->plugin_specific);
++    delete instance;
++}
++
++static AndroidAudioPluginFactory factory { aapInstantiate, aapRelease, nullptr };
++
++} // namespace cmaj::plugin::aap
++
++extern "C" AndroidAudioPluginFactory* GetAndroidAudioPluginFactory()
++{
++    return &cmaj::plugin::aap::factory;
++}

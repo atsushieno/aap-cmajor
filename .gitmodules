@@ -1,0 +1,6 @@
+[submodule "external/aap-core"]
+	path = external/aap-core
+	url = https://github.com/atsushieno/aap-core.git
+[submodule "external/cmajor"]
+	path = external/cmajor
+	url = https://github.com/cmajor-lang/cmajor.git
