@@ -1,8 +1,8 @@
 diff --git a/modules/CMakeLists.txt b/modules/CMakeLists.txt
-index d798a19..9aeca55 100644
+index 8354289..2e05ce5 100644
 --- a/modules/CMakeLists.txt
 +++ b/modules/CMakeLists.txt
-@@ -82,6 +82,8 @@ function (MAKE_CMAJ_LIBRARY)
+@@ -84,6 +84,8 @@ function (MAKE_CMAJ_LIBRARY)
      elseif (${CMAKE_SYSTEM_NAME} MATCHES "Android")
          if (${CMAKE_SYSTEM_PROCESSOR} MATCHES "aarch64")
              set (LLVM_PATH_ROOT ${LLVM_RELEASE_DIR}/android/arm64)
@@ -11,7 +11,7 @@ index d798a19..9aeca55 100644
          endif()
          set (LLVM_EXTRA_LIBS z)
      elseif (${CMAKE_SYSTEM_NAME} MATCHES "Windows")
-@@ -439,6 +441,25 @@ function (MAKE_CMAJ_LIBRARY)
+@@ -441,6 +443,25 @@ function (MAKE_CMAJ_LIBRARY)
              ${CHOC_TARGET}
      )
  
@@ -38,59 +38,63 @@ index d798a19..9aeca55 100644
          if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
              find_package(PkgConfig REQUIRED)
 diff --git a/modules/compiler/src/backends/LLVM/cmaj_LLVMGenerator.h b/modules/compiler/src/backends/LLVM/cmaj_LLVMGenerator.h
-index 412a446..5d0754a 100644
+index 209d734..fed2bf9 100644
 --- a/modules/compiler/src/backends/LLVM/cmaj_LLVMGenerator.h
 +++ b/modules/compiler/src/backends/LLVM/cmaj_LLVMGenerator.h
-@@ -320,6 +320,17 @@ struct LLVMCodeGenerator
+@@ -312,6 +312,26 @@ struct LLVMCodeGenerator
+         }
+     }
+ 
++    static void fixHostTargetTriple ([[maybe_unused]] ::llvm::orc::JITTargetMachineBuilder& machineBuilder)
++    {
++       #ifdef __ANDROID__
++        // detectHost() takes its triple from LLVM_HOST_TRIPLE, which is baked in when LLVM
++        // is configured. Our Android LLVM is cross-built without overriding it, so it reports
++        // the build machine's triple (x86_64-unknown-linux-gnu), and since the X86 backend is
++        // linked in too, the JIT happily emits x86 code which then dies with SIGILL on the
++        // device. Use the triple of the architecture we were actually compiled for instead.
++        #if defined (__aarch64__)
++         machineBuilder.getTargetTriple() = ::llvm::Triple ("aarch64-unknown-linux-android");
++        #elif defined (__x86_64__)
++         machineBuilder.getTargetTriple() = ::llvm::Triple ("x86_64-unknown-linux-android");
++        #elif defined (__arm__)
++         machineBuilder.getTargetTriple() = ::llvm::Triple ("armv7a-unknown-linux-androideabi");
++        #elif defined (__i386__)
++         machineBuilder.getTargetTriple() = ::llvm::Triple ("i686-unknown-linux-android");
++        #endif
++       #endif
++    }
++
+     std::unique_ptr<::llvm::TargetMachine> getNativeTargetMachine() const
+     {
+         if (auto machineBuilder = ::llvm::orc::JITTargetMachineBuilder::detectHost())
+@@ -320,6 +340,8 @@ struct LLVMCodeGenerator
              opts.ExceptionModel = ::llvm::ExceptionHandling::None;
              opts.setFPDenormalMode (::llvm::DenormalMode::getPositiveZero());
  
-+           #ifdef __ANDROID__
-+            // detectHost() identifies the running CPU (e.g. "cortex-a78" plus feature bits
-+            // like sha2/lse/neon), but the AArch64 target's own subtarget tables in our
-+            // bundled Android LLVM build don't recognise those names, so they get silently
-+            // ignored - leaving a subtarget that doesn't support 64-bit codegen at all
-+            // ("LLVM ERROR: 64-bit code requested on a subtarget that doesn't support it!").
-+            // Fall back to a generic baseline CPU with no extra features on this platform.
-+            machineBuilder->setCPU ("generic");
-+            machineBuilder->getFeatures() = ::llvm::SubtargetFeatures();
-+           #endif
++            fixHostTargetTriple (*machineBuilder);
 +
              machineBuilder->setCodeGenOptLevel (getCodeGenOptLevel (buildSettings.getOptimisationLevel()));
  
              if (auto tm = machineBuilder->createTargetMachine())
 diff --git a/modules/compiler/src/backends/LLVM/cmaj_LLVMPerformer.cpp b/modules/compiler/src/backends/LLVM/cmaj_LLVMPerformer.cpp
-index bdd0b4d..0c78655 100644
+index bdd0b4d..0e4b717 100644
 --- a/modules/compiler/src/backends/LLVM/cmaj_LLVMPerformer.cpp
 +++ b/modules/compiler/src/backends/LLVM/cmaj_LLVMPerformer.cpp
-@@ -196,6 +196,18 @@ struct LLJITHolder
-             opts.setFPDenormalMode (::llvm::DenormalMode::getPositiveZero());
-             opts.setFP32DenormalMode (::llvm::DenormalMode::getPositiveZero());
+@@ -190,6 +190,8 @@ struct LLJITHolder
  
-+           #ifdef __ANDROID__
-+            // detectHost() asks LLVM's Support library to identify the running CPU (e.g.
-+            // "cortex-a78" plus feature bits like sha2/lse/neon), but the AArch64 target's
-+            // own subtarget tables in our bundled Android LLVM build don't recognise those
-+            // names, so every one of them gets silently ignored - leaving a subtarget that
-+            // doesn't even support 64-bit codegen ("LLVM ERROR: 64-bit code requested on a
-+            // subtarget that doesn't support it!"). Fall back to a generic baseline CPU with
-+            // no extra features instead of trusting the host detection on this platform.
-+            machineBuilder->setCPU ("generic");
-+            machineBuilder->getFeatures() = ::llvm::SubtargetFeatures();
-+           #endif
+         if (auto machineBuilder = ::llvm::orc::JITTargetMachineBuilder::detectHost())
+         {
++            LLVMCodeGenerator::fixHostTargetTriple (*machineBuilder);
 +
-             machineBuilder->setCodeGenOptLevel (getCodeGenOptLevel (optimisationLevel));
- 
-             ::llvm::orc::LLJITBuilder builder;
-@@ -846,6 +858,12 @@ std::string generateAssembler (const cmaj::ProgramInterface& p,
+             auto targetTriple = machineBuilder->getTargetTriple();
+             auto& opts = machineBuilder->getOptions();
+             opts.ExceptionModel = ::llvm::ExceptionHandling::None;
+@@ -846,6 +848,8 @@ std::string generateAssembler (const cmaj::ProgramInterface& p,
              opts.ExceptionModel = ::llvm::ExceptionHandling::None;
              opts.setFPDenormalMode (::llvm::DenormalMode::getPositiveZero());
  
-+           #ifdef __ANDROID__
-+            // see the matching comment in LLJITHolder's constructor above.
-+            machineBuilder->setCPU ("generic");
-+            machineBuilder->getFeatures() = ::llvm::SubtargetFeatures();
-+           #endif
++            LLVMCodeGenerator::fixHostTargetTriple (*machineBuilder);
 +
              machineBuilder->setCodeGenOptLevel (LLVMCodeGenerator::getCodeGenOptLevel (buildSettings.getOptimisationLevel()));
  
@@ -148,10 +152,10 @@ index 0000000..78465ef
 +)
 diff --git a/modules/plugin/include/aap/cmaj_AAPPlugin.cpp b/modules/plugin/include/aap/cmaj_AAPPlugin.cpp
 new file mode 100644
-index 0000000..2ba204f
+index 0000000..21c8bfd
 --- /dev/null
 +++ b/modules/plugin/include/aap/cmaj_AAPPlugin.cpp
-@@ -0,0 +1,349 @@
+@@ -0,0 +1,382 @@
 +//
 +//     ,ad888ba,                              88
 +//    d8"'    "8b
@@ -255,8 +259,21 @@ index 0000000..2ba204f
 +}
 +
 +//==============================================================================
-+// A minimal CLAP host. This wrapper doesn't (yet) forward any of the host-side CLAP
-+// extensions through to the AAP host, so these are all no-ops for now.
++// cmajor's CLAP plugin only publishes its audio ports (and so only wires up its channel
++// buffers in process()) when the host claims to support CLAP_AUDIO_PORTS_RESCAN_LIST -
++// in the JIT case it otherwise leaves the port list empty, and then reads the input
++// channels from null pointers. Our ports are fixed and our patch never changes after
++// loading, so we can just say yes and treat any rescan request as a no-op.
++static const clap_host_audio_ports_t hostAudioPorts
++{
++    [] (const clap_host_t*, uint32_t) -> bool { return true; },
++    [] (const clap_host_t*, uint32_t) {}
++};
++
++//==============================================================================
++// A minimal CLAP host. Apart from the audio ports extension above, this wrapper doesn't
++// (yet) forward any of the host-side CLAP extensions through to the AAP host, so the
++// rest of these are all no-ops for now.
 +struct Host  : public clap_host_t
 +{
 +    Host()
@@ -267,7 +284,15 @@ index 0000000..2ba204f
 +        vendor = "cmajor";
 +        url = "";
 +        version = "0.1";
-+        get_extension    = [] (const clap_host_t*, const char*) -> const void* { return nullptr; };
++
++        get_extension = [] (const clap_host_t*, const char* extensionID) -> const void*
++        {
++            if (std::strcmp (extensionID, CLAP_EXT_AUDIO_PORTS) == 0)
++                return std::addressof (hostAudioPorts);
++
++            return nullptr;
++        };
++
 +        request_restart  = [] (const clap_host_t*) {};
 +        request_process  = [] (const clap_host_t*) {};
 +        request_callback = [] (const clap_host_t*) {};
@@ -281,6 +306,17 @@ index 0000000..2ba204f
 +        nullptr,
 +        [] (const clap_input_events_t*) -> uint32_t { return 0; },
 +        [] (const clap_input_events_t*, uint32_t) -> const clap_event_header_t* { return nullptr; }
++    };
++}
++
++// cmajor's CLAP process() binds out_events to a reference unconditionally, so it must
++// never be null even though we currently drop anything the plugin sends back.
++inline clap_output_events_t createDiscardingOutputEventQueue()
++{
++    return
++    {
++        nullptr,
++        [] (const clap_output_events_t*, const clap_event_header_t*) -> bool { return false; }
 +    };
 +}
 +
@@ -396,6 +432,7 @@ index 0000000..2ba204f
 +    clap_audio_buffer_t outputs { outChannels.data(), nullptr, 2, 0, 0 };
 +
 +    auto emptyEvents = createEmptyInputEventQueue();
++    auto discardedEvents = createDiscardingOutputEventQueue();
 +
 +    const clap_process_t process
 +    {
@@ -407,7 +444,7 @@ index 0000000..2ba204f
 +        1,
 +        1,
 +        std::addressof (emptyEvents),
-+        nullptr
++        std::addressof (discardedEvents)
 +    };
 +
 +    wrapper.plugin->process (wrapper.plugin.get(), std::addressof (process));
