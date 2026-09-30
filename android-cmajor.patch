@@ -1,3 +1,30 @@
+diff --git a/include/cmajor/helpers/cmaj_Patch.h b/include/cmajor/helpers/cmaj_Patch.h
+index 5aad5a6..4cd4c52 100644
+--- a/include/cmajor/helpers/cmaj_Patch.h
++++ b/include/cmajor/helpers/cmaj_Patch.h
+@@ -783,15 +783,17 @@ struct Patch::PatchWorker  : public PatchView
+             context->initialise ([this] (const choc::value::ValueView& msg) { patch.handleClientMessage (*this, msg); },
+                                  [f = setErrorCallback] (const std::string& error) { f (error); });
+ 
++        // The queued requests are run outside the lock, as a worker may reply synchronously
++        std::vector<std::function<void()>> queuedRequests;
++
+         {
+             std::unique_lock<std::mutex> l (m);
+-
+-            for (size_t i = 0; i < queuedSendMessageRequests.size(); i++)
+-                queuedSendMessageRequests[i]();
+-
+-            queuedSendMessageRequests.clear();
++            queuedRequests.swap (queuedSendMessageRequests);
+             patchWorkerInitialised = true;
+         }
++
++        for (auto& request : queuedRequests)
++            request();
+     }
+ 
+ private:
 diff --git a/modules/CMakeLists.txt b/modules/CMakeLists.txt
 index 8354289..2e05ce5 100644
 --- a/modules/CMakeLists.txt
@@ -117,10 +144,10 @@ index 8e7a987..29323d4 100644
 \ No newline at end of file
 diff --git a/modules/plugin/include/aap/CMakeLists.txt b/modules/plugin/include/aap/CMakeLists.txt
 new file mode 100644
-index 0000000..78465ef
+index 0000000..7e475c1
 --- /dev/null
 +++ b/modules/plugin/include/aap/CMakeLists.txt
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,32 @@
 +cmake_minimum_required(VERSION 3.16..3.22)
 +
 +# Experimental Android Audio Plugin (AAP) backend for cmajor - see cmaj_AAPPlugin.cpp.
@@ -141,6 +168,9 @@ index 0000000..78465ef
 +
 +target_compile_features(aap-cmajor-sample PRIVATE cxx_std_17)
 +
++# Patch workers run in QuickJS, since there's no WebView to host them in a plugin service.
++target_compile_definitions(aap-cmajor-sample PRIVATE CMAJ_USE_QUICKJS_WORKER=1)
++
 +target_link_libraries(aap-cmajor-sample
 +    PRIVATE
 +        aap_cmajor_engine_lib
@@ -152,10 +182,10 @@ index 0000000..78465ef
 +)
 diff --git a/modules/plugin/include/aap/cmaj_AAPPlugin.cpp b/modules/plugin/include/aap/cmaj_AAPPlugin.cpp
 new file mode 100644
-index 0000000..21c8bfd
+index 0000000..63eaf03
 --- /dev/null
 +++ b/modules/plugin/include/aap/cmaj_AAPPlugin.cpp
-@@ -0,0 +1,382 @@
+@@ -0,0 +1,731 @@
 +//
 +//     ,ad888ba,                              88
 +//    d8"'    "8b
@@ -183,65 +213,104 @@ index 0000000..21c8bfd
 +// fairly directly - prepare/activate/process/deactivate on the AAP side become
 +// activate/start_processing/process/stop_processing on the CLAP side.
 +//
-+// This first cut proves out the path end-to-end with a small embedded stereo gain
-+// patch, run by cmajor's JIT engine at runtime (no ahead-of-time codegen needed).
-+// It only handles audio ports - no MIDI, no host-side parameter automation, no
-+// state save/load and no GUI yet.
++// It loads the Pro54 example patch from the APK assets, run by cmajor's JIT engine at
++// runtime (no ahead-of-time codegen needed). It handles audio ports, parameters (exposed
++// through AAP's parameters extension, with parameter changes arriving as AAP parameter
++// SysEx8 on the MIDI2 input port) and MIDI channel messages - no state save/load and no
++// GUI yet.
 +
 +#include "../clap/cmaj_CLAPPlugin.h"
 +
 +#include <aap/android-audio-plugin.h>
++#include <aap/core/android/android-application-context.h>
++#include "choc/platform/choc_AndroidJNIHelpers.h"
++#include <aap/ext/parameters.h>
++#include <aap/ext/midi.h>
++#include <android/asset_manager_jni.h>
 +
 +#include <array>
++#include <atomic>
++#include <cstdio>
 +#include <cstring>
 +#include <memory>
++#include <mutex>
++#include <vector>
 +
 +namespace cmaj::plugin::aap
 +{
 +
 +//==============================================================================
-+// A tiny embedded cmajor patch, just enough to prove out the AAP <-> CLAP <-> cmajor
-+// path: a stereo gain effect with one parameter (not yet exposed to the AAP host).
-+static constexpr const char* manifestSource = R"({
-+    "CmajorVersion": 1,
-+    "ID": "dev.cmajor.aap.sample.gain",
-+    "version": "1.0",
-+    "name": "AAP Cmajor Sample",
-+    "description": "An experimental cmajor-powered Android Audio Plugin",
-+    "category": "effect",
-+    "manufacturer": "Cmajor",
-+    "isInstrument": false,
-+    "source": ["sample.cmajor"]
-+})";
++// The patch is loaded from the APK assets, where the app bundles the Pro54 example patch
++// folder (see app/src/main/assets/patches).
++static const std::filesystem::path patchAssetFolder = "patches/Pro54";
++static constexpr const char* patchManifestFile = "Pro54.cmajorpatch";
 +
-+static constexpr const char* cmajorSource = R"(
-+    graph Gain  [[ main ]]
++// The Java AssetManager must outlive the native one obtained from it, so its global
++// reference is deliberately never released.
++inline AAssetManager* getAssetManager()
++{
++    static AAssetManager* assetManager = []() -> AAssetManager*
 +    {
-+        input stream float32<2> in;
-+        output stream float32<2> out;
++        auto env = choc::android::getEnv();
++        auto context = choc::android::getApplicationContext();
 +
-+        input value float32 gain  [[ name: "Gain", min: 0, max: 1, init: 0.75 ]];
++        if (env == nullptr || context == nullptr)
++            return nullptr;
 +
-+        connection in * gain -> out;
-+    }
-+)";
++        auto contextClass = env->GetObjectClass (context);
++        auto getAssets = env->GetMethodID (contextClass, "getAssets", "()Landroid/content/res/AssetManager;");
++        auto assets = getAssets != nullptr ? env->CallObjectMethod (context, getAssets) : nullptr;
++        env->DeleteLocalRef (contextClass);
++
++        if (choc::android::checkAndClearException (*env) || assets == nullptr)
++            return nullptr;
++
++        auto globalAssets = env->NewGlobalRef (assets);
++        env->DeleteLocalRef (assets);
++        return AAssetManager_fromJava (env, globalAssets);
++    }();
++
++    return assetManager;
++}
++
++inline AAsset* openPatchAsset (const std::filesystem::path& path, int mode)
++{
++    auto assetManager = getAssetManager();
++
++    if (assetManager == nullptr)
++        return nullptr;
++
++    auto assetPath = (patchAssetFolder / path.relative_path()).lexically_normal().generic_string();
++    return AAssetManager_open (assetManager, assetPath.c_str(), mode);
++}
 +
 +inline cmaj::plugin::Environment createEnvironment()
 +{
 +    auto readFile = [] (const std::filesystem::path& path) -> std::unique_ptr<std::istream>
 +    {
-+        if (path == "sample.cmajorpatch")
-+            return std::make_unique<std::istringstream> (std::string (manifestSource), std::ios::binary);
++        auto asset = openPatchAsset (path, AASSET_MODE_BUFFER);
 +
-+        if (path == "sample.cmajor")
-+            return std::make_unique<std::istringstream> (std::string (cmajorSource), std::ios::binary);
++        if (asset == nullptr)
++            return {};
 +
-+        return {};
++        std::unique_ptr<std::istream> result;
++
++        if (auto data = static_cast<const char*> (AAsset_getBuffer (asset)))
++            result = std::make_unique<std::istringstream> (std::string (data, static_cast<size_t> (AAsset_getLength (asset))), std::ios::binary);
++
++        AAsset_close (asset);
++        return result;
 +    };
 +
 +    auto fileExists = [] (const std::filesystem::path& path)
 +    {
-+        return path == "sample.cmajorpatch" || path == "sample.cmajor";
++        auto asset = openPatchAsset (path, AASSET_MODE_UNKNOWN);
++
++        if (asset == nullptr)
++            return false;
++
++        AAsset_close (asset);
++        return true;
 +    };
 +
 +    return
@@ -299,16 +368,6 @@ index 0000000..21c8bfd
 +    }
 +};
 +
-+inline clap_input_events_t createEmptyInputEventQueue()
-+{
-+    return
-+    {
-+        nullptr,
-+        [] (const clap_input_events_t*) -> uint32_t { return 0; },
-+        [] (const clap_input_events_t*, uint32_t) -> const clap_event_header_t* { return nullptr; }
-+    };
-+}
-+
 +// cmajor's CLAP process() binds out_events to a reference unconditionally, so it must
 +// never be null even though we currently drop anything the plugin sends back.
 +inline clap_output_events_t createDiscardingOutputEventQueue()
@@ -321,10 +380,27 @@ index 0000000..21c8bfd
 +}
 +
 +//==============================================================================
++// The loaded patch's parameters, as reported by the CLAP plugin. The AAP parameter ID of each
++// parameter is its index in this list (cmajor's CLAP parameter IDs are not guaranteed to fit
++// into AAP's 0-16383 ID range).
++struct ParameterTable
++{
++    std::vector<clap_param_info_t> infos;
++};
++
++union InputEvent
++{
++    clap_event_header_t header;
++    clap_event_param_value_t parameter;
++    clap_event_midi_t midi;
++};
++
++//==============================================================================
 +struct Wrapper
 +{
-+    Wrapper()
-+        : plugin (cmaj::plugin::clap::create (descriptor, host, "sample.cmajorpatch", createEnvironment()))
++    Wrapper (AndroidAudioPluginHost* hostToUse)
++        : aapHost (hostToUse),
++          plugin (cmaj::plugin::clap::create (descriptor, host, patchManifestFile, createEnvironment()))
 +    {
 +        if (plugin != nullptr)
 +            initialised = plugin->init (plugin.get());
@@ -344,6 +420,76 @@ index 0000000..21c8bfd
 +
 +    bool isValid() const  { return plugin != nullptr && initialised; }
 +
++    // The JIT engine only loads the patch (and hence knows its parameters) when the CLAP plugin
++    // is activated, i.e. at AAP prepare(). So the parameter list is (re)built there, and the AAP
++    // host is told to rescan it.
++    void rebuildParameterTable()
++    {
++        auto table = std::make_unique<ParameterTable>();
++
++        if (auto params = static_cast<const clap_plugin_params_t*> (plugin->get_extension (plugin.get(), CLAP_EXT_PARAMS)))
++        {
++            auto count = std::min<uint32_t> (params->count (plugin.get()), 16384);
++
++            for (uint32_t i = 0; i < count; ++i)
++            {
++                clap_param_info_t info {};
++
++                if (params->get_info (plugin.get(), i, std::addressof (info)))
++                    table->infos.push_back (info);
++            }
++        }
++
++        // Published tables are never freed while the plugin is alive, since the host may be
++        // reading the previous one on another thread (and the audio thread reads it lock-free).
++        std::lock_guard<std::mutex> lock (parameterTablesMutex);
++        parameterTable.store (table.get(), std::memory_order_release);
++        parameterTables.push_back (std::move (table));
++    }
++
++    // AAP instruments have no audio inputs, but a patch may still have some (Pro54 has an
++    // external audio input), so they are fed with silence.
++    void rebuildSilentInputs (uint32_t maxFrames)
++    {
++        silentInputs.clear();
++        silentChannels.clear();
++        silence.assign (maxFrames, 0.0f);
++
++        auto audioPorts = static_cast<const clap_plugin_audio_ports_t*> (plugin->get_extension (plugin.get(), CLAP_EXT_AUDIO_PORTS));
++        auto numPorts = audioPorts != nullptr ? audioPorts->count (plugin.get(), true) : 0;
++        std::vector<uint32_t> channelCounts;
++
++        for (uint32_t i = 0; i < numPorts; ++i)
++        {
++            clap_audio_port_info_t info {};
++            channelCounts.push_back (audioPorts->get (plugin.get(), i, true, std::addressof (info)) ? info.channel_count : 0);
++        }
++
++        for (auto count : channelCounts)
++            silentChannels.insert (silentChannels.end(), count, silence.data());
++
++        auto channels = silentChannels.data();
++
++        for (auto count : channelCounts)
++        {
++            silentInputs.push_back ({ channels, nullptr, count, 0, 0 });
++            channels += count;
++        }
++    }
++
++    const ParameterTable* getParameterTable() const  { return parameterTable.load (std::memory_order_acquire); }
++
++    void notifyParameterLayoutChanged()
++    {
++        if (aapHost == nullptr || aapHost->get_extension == nullptr)
++            return;
++
++        if (auto ext = static_cast<aap_parameters_host_extension_t*> (aapHost->get_extension (aapHost, AAP_PARAMETERS_EXTENSION_URI)))
++            if (ext->notify_parameters_changed != nullptr)
++                ext->notify_parameters_changed (ext, aapHost);
++    }
++
++    AndroidAudioPluginHost* aapHost;
 +    Host host;
 +    const clap_plugin_descriptor_t descriptor {};
 +    cmaj::plugin::clap::PluginPtr plugin;
@@ -351,19 +497,29 @@ index 0000000..21c8bfd
 +    bool initialised = false;
 +    bool active = false;
 +    bool processing = false;
++
++    std::mutex parameterTablesMutex;
++    std::vector<std::unique_ptr<ParameterTable>> parameterTables;
++    std::atomic<const ParameterTable*> parameterTable { nullptr };
++
++    std::vector<float> silence;
++    std::vector<float*> silentChannels;
++    std::vector<clap_audio_buffer_t> silentInputs;
++
++    // audio thread only: events found in the current block's MIDI2 input
++    std::array<InputEvent, 256> pendingEvents {};
++    uint32_t numPendingEvents = 0;
 +};
 +
 +//==============================================================================
-+// Port layout: this wrapper declares its own fixed ports (below, via aapGetPluginInfo)
-+// rather than relying on ports declared in aap_metadata.xml, so these indices are
-+// entirely under our control and always match what the host will ask for.
++// Port layout: we don't declare ports in aap_metadata.xml, so aap-core applies its default
++// layout for instruments: audio out L/R, then MIDI2 in and MIDI2 out.
 +enum Port : uint32_t
 +{
-+    audioInLeft   = 0,
-+    audioInRight  = 1,
-+    audioOutLeft  = 2,
-+    audioOutRight = 3,
-+    numPorts      = 4
++    audioOutLeft  = 0,
++    audioOutRight = 1,
++    midi2In       = 2,
++    numAudioPorts = 2
 +};
 +
 +struct PortInfo
@@ -374,8 +530,6 @@ index 0000000..21c8bfd
 +
 +static constexpr PortInfo ports[] =
 +{
-+    { Port::audioInLeft,   "Audio In L" },
-+    { Port::audioInRight,  "Audio In R" },
 +    { Port::audioOutLeft,  "Audio Out L" },
 +    { Port::audioOutRight, "Audio Out R" },
 +};
@@ -399,6 +553,13 @@ index 0000000..21c8bfd
 +    auto maxFrames = static_cast<uint32_t> (buffer->num_frames (buffer));
 +
 +    wrapper.active = wrapper.plugin->activate (wrapper.plugin.get(), static_cast<double> (sampleRate), 1, maxFrames);
++
++    if (wrapper.active)
++    {
++        wrapper.rebuildSilentInputs (maxFrames);
++        wrapper.rebuildParameterTable();
++        wrapper.notifyParameterLayoutChanged();
++    }
 +}
 +
 +void aapActivate (AndroidAudioPlugin* plugin)
@@ -409,6 +570,170 @@ index 0000000..21c8bfd
 +        wrapper.processing = wrapper.plugin->start_processing (wrapper.plugin.get());
 +}
 +
++//==============================================================================
++inline uint32_t getUmpSizeInBytes (uint32_t firstWord)
++{
++    switch (firstWord >> 28)
++    {
++        case 0x0: case 0x1: case 0x2: case 0x6: case 0x7:   return 4;
++        case 0x3: case 0x4: case 0x8: case 0x9: case 0xA:   return 8;
++        case 0xB: case 0xC:                                  return 12;
++        default:                                             return 16;
++    }
++}
++
++// Converts a MIDI 1.0 or MIDI 2.0 channel voice UMP into MIDI 1.0 bytes.
++inline bool toMidi1Message (const uint32_t* ump, std::array<uint8_t, 3>& bytes)
++{
++    auto messageType = ump[0] >> 28;
++    auto status = static_cast<uint8_t> ((ump[0] >> 16) & 0xFF);
++    auto data1 = static_cast<uint8_t> ((ump[0] >> 8) & 0x7F);
++
++    if (messageType == 0x2)
++    {
++        bytes = { status, data1, static_cast<uint8_t> (ump[0] & 0x7F) };
++        return true;
++    }
++
++    if (messageType != 0x4)
++        return false;
++
++    auto sevenBitData = static_cast<uint8_t> (ump[1] >> 25);
++
++    switch (status >> 4)
++    {
++        case 0x8: case 0xA: case 0xB:
++            bytes = { status, data1, sevenBitData };
++            return true;
++
++        case 0x9: // a MIDI 2.0 note-on with zero velocity is still a note-on
++            bytes = { status, data1, std::max<uint8_t> (sevenBitData, 1) };
++            return true;
++
++        case 0xC:
++            bytes = { status, static_cast<uint8_t> ((ump[1] >> 24) & 0x7F), 0 };
++            return true;
++
++        case 0xD:
++            bytes = { status, sevenBitData, 0 };
++            return true;
++
++        case 0xE:
++        {
++            auto bend = ump[1] >> 18;
++            bytes = { status, static_cast<uint8_t> (bend & 0x7F), static_cast<uint8_t> (bend >> 7) };
++            return true;
++        }
++
++        default:
++            return false;
++    }
++}
++
++// Collects the MIDI2 input as CLAP events. AAP parameter SysEx8 messages and MIDI 2.0
++// assignable controllers (NRPN) on channel 0 become parameter changes, other channel
++// voice messages are passed on as MIDI.
++inline void collectInputEvents (Wrapper& wrapper, aap_buffer_t* buffer)
++{
++    wrapper.numPendingEvents = 0;
++
++    auto table = wrapper.getParameterTable();
++
++    if (table == nullptr || buffer->num_ports (buffer) <= Port::midi2In)
++        return;
++
++    auto header = static_cast<AAPMidiBufferHeader*> (buffer->get_buffer (buffer, Port::midi2In));
++
++    if (header == nullptr)
++        return;
++
++    auto data = reinterpret_cast<const uint8_t*> (header + 1);
++    auto capacity = static_cast<uint32_t> (buffer->get_buffer_size (buffer, Port::midi2In));
++    auto length = std::min<uint32_t> (header->length, capacity > sizeof (AAPMidiBufferHeader) ? capacity - sizeof (AAPMidiBufferHeader) : 0);
++
++    auto addChange = [&] (uint32_t parameterIndex, uint32_t transportValue)
++    {
++        if (parameterIndex >= table->infos.size() || wrapper.numPendingEvents >= wrapper.pendingEvents.size())
++            return;
++
++        auto& info = table->infos[parameterIndex];
++        auto& event = wrapper.pendingEvents[wrapper.numPendingEvents++].parameter;
++        event = {};
++        event.header.size = sizeof (clap_event_param_value_t);
++        event.header.time = 0;
++        event.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
++        event.header.type = CLAP_EVENT_PARAM_VALUE;
++        event.param_id = info.id;
++        event.cookie = info.cookie;
++        event.note_id = -1;
++        event.port_index = -1;
++        event.channel = -1;
++        event.key = -1;
++        event.value = aapParameterTransportUint32ToPlain (info.min_value, info.max_value, transportValue);
++    };
++
++    auto addMidi = [&] (const std::array<uint8_t, 3>& bytes)
++    {
++        if (wrapper.numPendingEvents >= wrapper.pendingEvents.size())
++            return;
++
++        auto& event = wrapper.pendingEvents[wrapper.numPendingEvents++].midi;
++        event = {};
++        event.header.size = sizeof (clap_event_midi_t);
++        event.header.time = 0;
++        event.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
++        event.header.type = CLAP_EVENT_MIDI;
++        event.port_index = 0;
++        std::copy (bytes.begin(), bytes.end(), event.data);
++    };
++
++    for (uint32_t offset = 0; offset + sizeof (uint32_t) <= length;)
++    {
++        auto ump = reinterpret_cast<const uint32_t*> (data + offset);
++        auto size = getUmpSizeInBytes (ump[0]);
++
++        if (offset + size > length)
++            break;
++
++        if (size == 16)
++        {
++            uint8_t group, channel, key, extra;
++            uint16_t index;
++            uint32_t value;
++
++            if (aapReadMidi2ParameterSysex8 (&group, &channel, &key, &extra, &index, &value, ump[0], ump[1], ump[2], ump[3]))
++                addChange (index, value);
++        }
++        else if ((ump[0] >> 28) == 0x4 && ((ump[0] >> 16) & 0xFF) == 0x30) // assignable controller, channel 0
++        {
++            addChange ((((ump[0] >> 8) & 0x7F) << 7) | (ump[0] & 0x7F), ump[1]);
++        }
++        else if (std::array<uint8_t, 3> bytes; toMidi1Message (ump, bytes))
++        {
++            addMidi (bytes);
++        }
++
++        offset += size;
++    }
++}
++
++inline clap_input_events_t createInputEventQueue (Wrapper& wrapper)
++{
++    return
++    {
++        std::addressof (wrapper),
++        [] (const clap_input_events_t* list) -> uint32_t
++        {
++            return static_cast<Wrapper*> (list->ctx)->numPendingEvents;
++        },
++        [] (const clap_input_events_t* list, uint32_t index) -> const clap_event_header_t*
++        {
++            auto& wrapper = *static_cast<Wrapper*> (list->ctx);
++            return index < wrapper.numPendingEvents ? std::addressof (wrapper.pendingEvents[index].header) : nullptr;
++        }
++    };
++}
++
 +void aapProcess (AndroidAudioPlugin* plugin, aap_buffer_t* buffer, int32_t frameCount, int64_t)
 +{
 +    auto& wrapper = *static_cast<Wrapper*> (plugin->plugin_specific);
@@ -416,11 +741,7 @@ index 0000000..21c8bfd
 +    if (! wrapper.processing)
 +        return;
 +
-+    std::array<float*, 2> inChannels
-+    {
-+        static_cast<float*> (buffer->get_buffer (buffer, Port::audioInLeft)),
-+        static_cast<float*> (buffer->get_buffer (buffer, Port::audioInRight))
-+    };
++    collectInputEvents (wrapper, buffer);
 +
 +    std::array<float*, 2> outChannels
 +    {
@@ -428,10 +749,9 @@ index 0000000..21c8bfd
 +        static_cast<float*> (buffer->get_buffer (buffer, Port::audioOutRight))
 +    };
 +
-+    clap_audio_buffer_t inputs  { inChannels.data(),  nullptr, 2, 0, 0 };
 +    clap_audio_buffer_t outputs { outChannels.data(), nullptr, 2, 0, 0 };
 +
-+    auto emptyEvents = createEmptyInputEventQueue();
++    auto inputEvents = createInputEventQueue (wrapper);
 +    auto discardedEvents = createDiscardingOutputEventQueue();
 +
 +    const clap_process_t process
@@ -439,11 +759,11 @@ index 0000000..21c8bfd
 +        -1,
 +        static_cast<uint32_t> (frameCount),
 +        nullptr,
-+        std::addressof (inputs),
++        wrapper.silentInputs.data(),
 +        std::addressof (outputs),
++        static_cast<uint32_t> (wrapper.silentInputs.size()),
 +        1,
-+        1,
-+        std::addressof (emptyEvents),
++        std::addressof (inputEvents),
 +        std::addressof (discardedEvents)
 +    };
 +
@@ -461,8 +781,45 @@ index 0000000..21c8bfd
 +    }
 +}
 +
-+void* aapGetExtension (AndroidAudioPlugin*, const char*)
++//==============================================================================
++inline Wrapper& getWrapper (AndroidAudioPlugin* plugin)  { return *static_cast<Wrapper*> (plugin->plugin_specific); }
++
++static aap_parameters_extension_t parametersExtension
 +{
++    nullptr,
++    [] (aap_parameters_extension_t*, AndroidAudioPlugin* plugin) -> int32_t
++    {
++        auto table = getWrapper (plugin).getParameterTable();
++        return table != nullptr ? static_cast<int32_t> (table->infos.size()) : 0;
++    },
++    [] (aap_parameters_extension_t*, AndroidAudioPlugin* plugin, int32_t index) -> aap_parameter_info_t
++    {
++        aap_parameter_info_t result {};
++        auto table = getWrapper (plugin).getParameterTable();
++
++        if (table == nullptr || index < 0 || index >= static_cast<int32_t> (table->infos.size()))
++            return result;
++
++        auto& info = table->infos[static_cast<size_t> (index)];
++        result.stable_id = static_cast<int16_t> (index);
++        std::snprintf (result.display_name, sizeof (result.display_name), "%s", info.name);
++        std::snprintf (result.path, sizeof (result.path), "%s", info.module);
++        result.min_value = info.min_value;
++        result.max_value = info.max_value;
++        result.default_value = info.default_value;
++        result.per_note_enabled = false;
++        return result;
++    },
++    [] (aap_parameters_extension_t*, AndroidAudioPlugin*, int32_t, int32_t) -> double { return 0; },
++    [] (aap_parameters_extension_t*, AndroidAudioPlugin*, int32_t) -> int32_t { return 0; },
++    [] (aap_parameters_extension_t*, AndroidAudioPlugin*, int32_t, int32_t) -> aap_parameter_enum_t { return {}; }
++};
++
++void* aapGetExtension (AndroidAudioPlugin*, const char* uri)
++{
++    if (std::strcmp (uri, AAP_PARAMETERS_EXTENSION_URI) == 0)
++        return std::addressof (parametersExtension);
++
 +    return nullptr;
 +}
 +
@@ -475,11 +832,11 @@ index 0000000..21c8bfd
 +    info.display_name        = [] (aap_plugin_info_t*) -> const char* { return "AAP Cmajor Sample"; };
 +    info.developer_name      = [] (aap_plugin_info_t*) -> const char* { return "AAP Developers"; };
 +    info.version             = [] (aap_plugin_info_t*) -> const char* { return "0.1"; };
-+    info.primary_category    = [] (aap_plugin_info_t*) -> const char* { return "Effect"; };
++    info.primary_category    = [] (aap_plugin_info_t*) -> const char* { return "Instrument"; };
 +    info.identifier_string   = [] (aap_plugin_info_t*) -> const char* { return "urn:org.androidaudioplugin/samples/cmajor/AAPCMajorSample"; };
 +    info.plugin_id           = [] (aap_plugin_info_t*) -> const char* { return "urn:org.androidaudioplugin/samples/cmajor/AAPCMajorSample"; };
 +
-+    info.get_port_count = [] (aap_plugin_info_t*) -> uint32_t { return static_cast<uint32_t> (Port::numPorts); };
++    info.get_port_count = [] (aap_plugin_info_t*) -> uint32_t { return static_cast<uint32_t> (Port::numAudioPorts); };
 +
 +    info.get_port = [] (aap_plugin_info_t*, uint32_t index) -> aap_plugin_info_port_t
 +    {
@@ -489,12 +846,7 @@ index 0000000..21c8bfd
 +        port.name = [] (aap_plugin_info_port_t* p) -> const char* { return static_cast<PortInfo*> (p->context)->name; };
 +        port.content_type = [] (aap_plugin_info_port_t*) -> aap_content_type { return AAP_CONTENT_TYPE_AUDIO; };
 +
-+        port.direction = [] (aap_plugin_info_port_t* p) -> aap_port_direction
-+        {
-+            auto index = static_cast<PortInfo*> (p->context)->index;
-+            return index == Port::audioInLeft || index == Port::audioInRight ? AAP_PORT_DIRECTION_INPUT
-+                                                                              : AAP_PORT_DIRECTION_OUTPUT;
-+        };
++        port.direction = [] (aap_plugin_info_port_t*) -> aap_port_direction { return AAP_PORT_DIRECTION_OUTPUT; };
 +
 +        return port;
 +    };
@@ -505,9 +857,36 @@ index 0000000..21c8bfd
 +    return info;
 +}
 +
-+AndroidAudioPlugin* aapInstantiate (AndroidAudioPluginFactory*, const char*, AndroidAudioPluginHost*)
++// choc's Android backend (used e.g. by cmaj::Patch to post parameter change notifications to
++// the main thread) needs the JavaVM and the application context. Our library is dlopen()-ed by
++// aap-core rather than loaded by System.loadLibrary(), so JNI_OnLoad() is never invoked; we get
++// them from aap-core instead.
++inline void initialiseChocForAndroid()
 +{
-+    auto wrapper = std::make_unique<Wrapper>();
++    static std::once_flag once;
++
++    std::call_once (once, []
++    {
++        auto vm = ::aap::get_android_jvm();
++        auto context = ::aap::get_android_application_context();
++
++        if (vm == nullptr || context == nullptr)
++            return;
++
++        JNIEnv* env = nullptr;
++
++        if (vm->GetEnv (reinterpret_cast<void**> (&env), JNI_VERSION_1_6) == JNI_EDETACHED)
++            vm->AttachCurrentThread (&env, nullptr);
++
++        choc::android::initialise (vm, context);
++    });
++}
++
++AndroidAudioPlugin* aapInstantiate (AndroidAudioPluginFactory*, const char*, AndroidAudioPluginHost* host)
++{
++    initialiseChocForAndroid();
++
++    auto wrapper = std::make_unique<Wrapper> (host);
 +
 +    if (! wrapper->isValid())
 +        return nullptr;
