@@ -1,5 +1,7 @@
 # aap-cmajor: use Cmajor patches as AAP
 
+![screenshot](https://github.com/user-attachments/assets/aedbe5cd-daeb-4877-ae0f-cf2aed53d77a)
+
 It is an experimental Cmajor integration to AAP ecosystem.
 
 This is so far a proof-of-concept demo of just loading their Pro54 patch
