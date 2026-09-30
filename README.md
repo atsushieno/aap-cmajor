@@ -1,6 +1,6 @@
 # aap-cmajor: use Cmajor patches as AAP
 
-![screenshot](https://github.com/user-attachments/assets/aedbe5cd-daeb-4877-ae0f-cf2aed53d77a)
+![screenshot](https://github.com/user-attachments/assets/77559f63-46b5-4b2c-bc28-ea4f1f836bb2)
 
 It is an experimental Cmajor integration to AAP ecosystem.
 
