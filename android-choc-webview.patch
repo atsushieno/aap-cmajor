@@ -40,10 +40,10 @@ index 0000000..f487734
 +}
 diff --git a/choc/gui/android/com/tracktion/choc/gui/ChocWebView.java b/choc/gui/android/com/tracktion/choc/gui/ChocWebView.java
 new file mode 100644
-index 0000000..6b30058
+index 0000000..082e94d
 --- /dev/null
 +++ b/choc/gui/android/com/tracktion/choc/gui/ChocWebView.java
-@@ -0,0 +1,124 @@
+@@ -0,0 +1,138 @@
 +/*
 +    This is the Java half of choc::ui::WebView's Android backend (see
 +    choc_AndroidWebViewJNI.h and choc_WebView.h's CHOC_ANDROID branch).
@@ -154,14 +154,28 @@ index 0000000..6b30058
 +        setBackgroundColor (transparent ? Color.TRANSPARENT : Color.WHITE);
 +    }
 +
-+    /// Called by the page via `window.chocNative.postMessage (json)`.
++    /// Called by the page via `window.chocNative.postMessage (json)`. This arrives on the
++    /// JavaBridge thread, but the native side may call back into the WebView, which is only
++    /// allowed on the main thread.
 +    @JavascriptInterface
 +    public void postMessage (String json)
 +    {
-+        nativePostMessage (nativeHandle, json);
++        post (() ->
++        {
++            if (nativeHandle != 0)
++                nativePostMessage (nativeHandle, json);
++        });
 +    }
 +
-+    private final long nativeHandle;
++    /// Called by the native side as it is deleted, after which it must not be called back.
++    @Override
++    public void destroy()
++    {
++        nativeHandle = 0;
++        super.destroy();
++    }
++
++    private volatile long nativeHandle;
 +    private final ArrayList<String> initScripts = new ArrayList<> ();
 +
 +    private static native void nativePostMessage (long nativeHandle, String json);
@@ -672,10 +686,10 @@ index 89d6059..da0f7b6 100644
  #elif CHOC_APPLE
  
 diff --git a/choc/gui/choc_WebView.h b/choc/gui/choc_WebView.h
-index fcfdf42..32303ed 100644
+index fcfdf42..902396e 100644
 --- a/choc/gui/choc_WebView.h
 +++ b/choc/gui/choc_WebView.h
-@@ -955,6 +955,173 @@ private:
+@@ -955,6 +955,177 @@ private:
      static constexpr long WKUserScriptInjectionTimeAtDocumentStart = 0;
  };
  
@@ -717,9 +731,13 @@ index fcfdf42..32303ed 100644
 +        };
 +
 +        if (fetchResource)
-+            callbacks.fetchResource = [this] (const std::string& path) -> std::optional<choc::android::FetchedResource>
++            callbacks.fetchResource = [this] (const std::string& url) -> std::optional<choc::android::FetchedResource>
 +            {
-+                if (auto resource = fetchResource (path))
++                // Anything outside our home URI is left for the WebView to load normally
++                if (! choc::text::startsWith (url, defaultURI))
++                    return {};
++
++                if (auto resource = fetchResource (url.substr (defaultURI.size() - 1)))
 +                    return choc::android::FetchedResource { resource->data, resource->mimeType };
 +
 +                return {};
@@ -849,6 +867,15 @@ index fcfdf42..32303ed 100644
  //==============================================================================
  #elif CHOC_WINDOWS
  
+@@ -1987,7 +2158,7 @@ inline std::string WebView::getURIHome (const Options& options)
+         return options.customSchemeURI + "/";
+     }
+ 
+-   #if CHOC_WINDOWS
++   #if CHOC_WINDOWS || CHOC_ANDROID  // neither can navigate to a custom scheme
+     return "https://choc.localhost/";
+    #else
+     return "choc://choc.choc/";
 diff --git a/choc/platform/choc_AndroidJNIHelpers.h b/choc/platform/choc_AndroidJNIHelpers.h
 new file mode 100644
 index 0000000..85083f2

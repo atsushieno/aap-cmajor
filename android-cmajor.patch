@@ -25,6 +25,74 @@ index 5aad5a6..4cd4c52 100644
      }
  
  private:
+diff --git a/include/cmajor/helpers/cmaj_PluginHelpers.h b/include/cmajor/helpers/cmaj_PluginHelpers.h
+index 6c281d0..e8f50ba 100644
+--- a/include/cmajor/helpers/cmaj_PluginHelpers.h
++++ b/include/cmajor/helpers/cmaj_PluginHelpers.h
+@@ -27,6 +27,10 @@
+  #include "cmaj_PatchWorker_WebView.h"
+ #endif
+ 
++#if CHOC_ANDROID
++ #include "choc/platform/choc_AndroidJNIHelpers.h"
++#endif
++
+ #include <filesystem>
+ #include <functional>
+ #include <istream>
+@@ -177,6 +181,17 @@ inline bool addChildView (void* parent, void* child)
+ 
+     ShowWindow (static_cast<HWND> (child), SW_SHOWNA);
+     return true;
++  #elif CHOC_ANDROID
++    // parent is an android.view.ViewGroup, child an android.view.View
++    auto env = choc::android::getEnv();
++
++    if (env == nullptr || parent == nullptr || child == nullptr)
++        return false;
++
++    choc::android::LocalRef<jclass> viewGroupClass (env->FindClass ("android/view/ViewGroup"));
++    auto addView = env->GetMethodID (viewGroupClass, "addView", "(Landroid/view/View;)V");
++    env->CallVoidMethod (static_cast<jobject> (parent), addView, static_cast<jobject> (child));
++    return ! choc::android::checkAndClearException (*env);
+   #else
+     (void) parent;
+     (void) child;
+@@ -195,6 +210,34 @@ inline bool setViewSize (void* view, uint32_t width, uint32_t height)
+     return true;
+   #elif CHOC_WINDOWS
+     return MoveWindow (static_cast<HWND> (view), 0, 0, static_cast<int> (width), static_cast<int> (height), true);
++  #elif CHOC_ANDROID
++    auto env = choc::android::getEnv();
++
++    if (env == nullptr || view == nullptr)
++        return false;
++
++    choc::android::LocalRef<jclass> viewClass (env->FindClass ("android/view/View"));
++    choc::android::LocalRef<jclass> layoutParamsClass (env->FindClass ("android/view/ViewGroup$LayoutParams"));
++    auto getLayoutParams = env->GetMethodID (viewClass, "getLayoutParams", "()Landroid/view/ViewGroup$LayoutParams;");
++    auto setLayoutParams = env->GetMethodID (viewClass, "setLayoutParams", "(Landroid/view/ViewGroup$LayoutParams;)V");
++
++    // Keep the parent's own LayoutParams subclass, if it has already assigned one
++    choc::android::LocalRef<jobject> layoutParams (env->CallObjectMethod (static_cast<jobject> (view), getLayoutParams));
++
++    if (layoutParams)
++    {
++        env->SetIntField (layoutParams, env->GetFieldID (layoutParamsClass, "width", "I"), static_cast<jint> (width));
++        env->SetIntField (layoutParams, env->GetFieldID (layoutParamsClass, "height", "I"), static_cast<jint> (height));
++    }
++    else
++    {
++        auto constructor = env->GetMethodID (layoutParamsClass, "<init>", "(II)V");
++        layoutParams = choc::android::LocalRef<jobject> (env->NewObject (layoutParamsClass, constructor,
++                                                                         static_cast<jint> (width), static_cast<jint> (height)));
++    }
++
++    env->CallVoidMethod (static_cast<jobject> (view), setLayoutParams, layoutParams.get());
++    return ! choc::android::checkAndClearException (*env);
+   #else
+     (void) view;
+     (void) width;
 diff --git a/modules/CMakeLists.txt b/modules/CMakeLists.txt
 index 8354289..2e05ce5 100644
 --- a/modules/CMakeLists.txt
@@ -182,10 +250,10 @@ index 0000000..7e475c1
 +)
 diff --git a/modules/plugin/include/aap/cmaj_AAPPlugin.cpp b/modules/plugin/include/aap/cmaj_AAPPlugin.cpp
 new file mode 100644
-index 0000000..63eaf03
+index 0000000..1b1eba0
 --- /dev/null
 +++ b/modules/plugin/include/aap/cmaj_AAPPlugin.cpp
-@@ -0,0 +1,731 @@
+@@ -0,0 +1,902 @@
 +//
 +//     ,ad888ba,                              88
 +//    d8"'    "8b
@@ -216,8 +284,8 @@ index 0000000..63eaf03
 +// It loads the Pro54 example patch from the APK assets, run by cmajor's JIT engine at
 +// runtime (no ahead-of-time codegen needed). It handles audio ports, parameters (exposed
 +// through AAP's parameters extension, with parameter changes arriving as AAP parameter
-+// SysEx8 on the MIDI2 input port) and MIDI channel messages - no state save/load and no
-+// GUI yet.
++// SysEx8 on the MIDI2 input port) and MIDI channel messages, and embeds the patch's own view
++// as the AAP native UI (see CmajorPatchViewFactory.java) - no state save/load yet.
 +
 +#include "../clap/cmaj_CLAPPlugin.h"
 +
@@ -226,6 +294,7 @@ index 0000000..63eaf03
 +#include "choc/platform/choc_AndroidJNIHelpers.h"
 +#include <aap/ext/parameters.h>
 +#include <aap/ext/midi.h>
++#include <aap/core/host/plugin-host.h>
 +#include <android/asset_manager_jni.h>
 +
 +#include <array>
@@ -234,6 +303,7 @@ index 0000000..63eaf03
 +#include <cstring>
 +#include <memory>
 +#include <mutex>
++#include <unordered_map>
 +#include <vector>
 +
 +namespace cmaj::plugin::aap
@@ -368,16 +438,9 @@ index 0000000..63eaf03
 +    }
 +};
 +
-+// cmajor's CLAP process() binds out_events to a reference unconditionally, so it must
-+// never be null even though we currently drop anything the plugin sends back.
-+inline clap_output_events_t createDiscardingOutputEventQueue()
-+{
-+    return
-+    {
-+        nullptr,
-+        [] (const clap_output_events_t*, const clap_event_header_t*) -> bool { return false; }
-+    };
-+}
++// The CLAP plugin keeps references to these, and may outlive its Wrapper (see ~Wrapper()).
++static const Host sharedHost;
++static const clap_plugin_descriptor_t sharedDescriptor {};
 +
 +//==============================================================================
 +// The loaded patch's parameters, as reported by the CLAP plugin. The AAP parameter ID of each
@@ -386,6 +449,7 @@ index 0000000..63eaf03
 +struct ParameterTable
 +{
 +    std::vector<clap_param_info_t> infos;
++    std::unordered_map<clap_id, uint16_t> indexByID;
 +};
 +
 +union InputEvent
@@ -400,7 +464,7 @@ index 0000000..63eaf03
 +{
 +    Wrapper (AndroidAudioPluginHost* hostToUse)
 +        : aapHost (hostToUse),
-+          plugin (cmaj::plugin::clap::create (descriptor, host, patchManifestFile, createEnvironment()))
++          plugin (cmaj::plugin::clap::create (sharedDescriptor, sharedHost, patchManifestFile, createEnvironment()))
 +    {
 +        if (plugin != nullptr)
 +            initialised = plugin->init (plugin.get());
@@ -416,6 +480,60 @@ index 0000000..63eaf03
 +
 +        if (active)
 +            plugin->deactivate (plugin.get());
++
++        // The editor's WebView must be destroyed on the main thread, and the plugin with it.
++        if (editorOpen && ! choc::messageloop::callerIsOnMessageThread())
++            choc::messageloop::postMessage ([p = std::shared_ptr<clap_plugin> (std::move (plugin))] { destroyEditor (*p); });
++        else if (editorOpen)
++            destroyEditor (*plugin);
++    }
++
++    //==============================================================================
++    // GUI (main thread only)
++    bool attachEditor (jobject parentViewGroup, double scale)
++    {
++        if (editorOpen)
++            closeEditor();
++
++        auto gui = getGUI (*plugin);
++
++        if (gui == nullptr || ! gui->create (plugin.get(), CMAJ_CLAP_WINDOW_API_ANDROID, false))
++            return false;
++
++        gui->set_scale (plugin.get(), scale);
++
++        clap_window_t window {};
++        window.api = CMAJ_CLAP_WINDOW_API_ANDROID;
++        window.ptr = parentViewGroup;
++
++        if (! gui->set_parent (plugin.get(), std::addressof (window)))
++        {
++            gui->destroy (plugin.get());
++            return false;
++        }
++
++        gui->show (plugin.get());
++        editorOpen = true;
++        return true;
++    }
++
++    void closeEditor()
++    {
++        if (editorOpen)
++            destroyEditor (*plugin);
++
++        editorOpen = false;
++    }
++
++    static const clap_plugin_gui_t* getGUI (const clap_plugin& p)
++    {
++        return static_cast<const clap_plugin_gui_t*> (p.get_extension (std::addressof (p), CLAP_EXT_GUI));
++    }
++
++    static void destroyEditor (const clap_plugin& p)
++    {
++        if (auto gui = getGUI (p))
++            gui->destroy (std::addressof (p));
 +    }
 +
 +    bool isValid() const  { return plugin != nullptr && initialised; }
@@ -436,7 +554,10 @@ index 0000000..63eaf03
 +                clap_param_info_t info {};
 +
 +                if (params->get_info (plugin.get(), i, std::addressof (info)))
++                {
++                    table->indexByID[info.id] = static_cast<uint16_t> (table->infos.size());
 +                    table->infos.push_back (info);
++                }
 +            }
 +        }
 +
@@ -490,13 +611,12 @@ index 0000000..63eaf03
 +    }
 +
 +    AndroidAudioPluginHost* aapHost;
-+    Host host;
-+    const clap_plugin_descriptor_t descriptor {};
 +    cmaj::plugin::clap::PluginPtr plugin;
 +
 +    bool initialised = false;
 +    bool active = false;
 +    bool processing = false;
++    std::atomic<bool> editorOpen { false };
 +
 +    std::mutex parameterTablesMutex;
 +    std::vector<std::unique_ptr<ParameterTable>> parameterTables;
@@ -509,6 +629,10 @@ index 0000000..63eaf03
 +    // audio thread only: events found in the current block's MIDI2 input
 +    std::array<InputEvent, 256> pendingEvents {};
 +    uint32_t numPendingEvents = 0;
++
++    // audio thread only: the current block's MIDI2 output
++    AAPMidiBufferHeader* midiOut = nullptr;
++    uint32_t midiOutCapacity = 0;
 +};
 +
 +//==============================================================================
@@ -519,6 +643,7 @@ index 0000000..63eaf03
 +    audioOutLeft  = 0,
 +    audioOutRight = 1,
 +    midi2In       = 2,
++    midi2Out      = 3,
 +    numAudioPorts = 2
 +};
 +
@@ -734,9 +859,69 @@ index 0000000..63eaf03
 +    };
 +}
 +
++//==============================================================================
++// The plugin writes the whole MIDI2 output of each block, starting from empty.
++inline void beginMidiOutput (Wrapper& wrapper, aap_buffer_t* buffer)
++{
++    wrapper.midiOut = nullptr;
++    wrapper.midiOutCapacity = 0;
++
++    if (buffer->num_ports (buffer) <= Port::midi2Out)
++        return;
++
++    auto header = static_cast<AAPMidiBufferHeader*> (buffer->get_buffer (buffer, Port::midi2Out));
++    auto size = static_cast<uint32_t> (buffer->get_buffer_size (buffer, Port::midi2Out));
++
++    if (header == nullptr || size <= sizeof (AAPMidiBufferHeader))
++        return;
++
++    header->length = 0;
++    wrapper.midiOut = header;
++    wrapper.midiOutCapacity = size - sizeof (AAPMidiBufferHeader);
++}
++
++// Parameter changes that the plugin reports (e.g. those made in its editor) are sent to the
++// host as AAP parameter SysEx8.
++inline bool writeOutputEvent (Wrapper& wrapper, const clap_event_header_t& event)
++{
++    auto table = wrapper.getParameterTable();
++
++    if (event.space_id != CLAP_CORE_EVENT_SPACE_ID || event.type != CLAP_EVENT_PARAM_VALUE
++         || table == nullptr || wrapper.midiOut == nullptr)
++        return false;
++
++    auto& change = reinterpret_cast<const clap_event_param_value_t&> (event);
++    auto found = table->indexByID.find (change.param_id);
++
++    if (found == table->indexByID.end() || wrapper.midiOut->length + 16 > wrapper.midiOutCapacity)
++        return false;
++
++    auto index = found->second;
++    auto& info = table->infos[index];
++    auto ump = reinterpret_cast<uint32_t*> (reinterpret_cast<uint8_t*> (wrapper.midiOut + 1) + wrapper.midiOut->length);
++    aapMidi2ParameterSysex8 (ump, ump + 1, ump + 2, ump + 3, 0, 0, 0, 0, index,
++                             aapParameterPlainToTransportUint32 (info.min_value, info.max_value, change.value));
++    wrapper.midiOut->length += 16;
++    return true;
++}
++
++inline clap_output_events_t createOutputEventQueue (Wrapper& wrapper)
++{
++    return
++    {
++        std::addressof (wrapper),
++        [] (const clap_output_events_t* list, const clap_event_header_t* event) -> bool
++        {
++            return event != nullptr && writeOutputEvent (*static_cast<Wrapper*> (list->ctx), *event);
++        }
++    };
++}
++
 +void aapProcess (AndroidAudioPlugin* plugin, aap_buffer_t* buffer, int32_t frameCount, int64_t)
 +{
 +    auto& wrapper = *static_cast<Wrapper*> (plugin->plugin_specific);
++
++    beginMidiOutput (wrapper, buffer);
 +
 +    if (! wrapper.processing)
 +        return;
@@ -752,7 +937,7 @@ index 0000000..63eaf03
 +    clap_audio_buffer_t outputs { outChannels.data(), nullptr, 2, 0, 0 };
 +
 +    auto inputEvents = createInputEventQueue (wrapper);
-+    auto discardedEvents = createDiscardingOutputEventQueue();
++    auto outputEvents = createOutputEventQueue (wrapper);
 +
 +    const clap_process_t process
 +    {
@@ -764,7 +949,7 @@ index 0000000..63eaf03
 +        static_cast<uint32_t> (wrapper.silentInputs.size()),
 +        1,
 +        std::addressof (inputEvents),
-+        std::addressof (discardedEvents)
++        std::addressof (outputEvents)
 +    };
 +
 +    wrapper.plugin->process (wrapper.plugin.get(), std::addressof (process));
@@ -911,9 +1096,109 @@ index 0000000..63eaf03
 +
 +static AndroidAudioPluginFactory factory { aapInstantiate, aapRelease, nullptr };
 +
++//==============================================================================
++// Native UI support for CmajorPatchViewFactory.java. These are called on the main thread.
++inline Wrapper* findWrapper (jlong serviceInstance, jint instanceId)
++{
++    auto service = reinterpret_cast<::aap::PluginService*> (serviceInstance);
++    auto instance = service != nullptr ? service->getLocalInstance (instanceId) : nullptr;
++    auto plugin = instance != nullptr ? instance->getPlugin() : nullptr;
++    return plugin != nullptr ? static_cast<Wrapper*> (plugin->plugin_specific) : nullptr;
++}
++
++// The size of the patch's own view in CSS pixels, if the patch has one.
++inline std::optional<std::array<uint32_t, 2>> getPatchViewSize()
++{
++    initialiseChocForAndroid();
++
++    auto manifest = createEnvironment().makePatchManifest (patchManifestFile);
++    auto view = manifest.findDefaultView();
++
++    if (view == nullptr || view->getSource().empty())
++        return {};
++
++    return std::array<uint32_t, 2> { view->getWidth(), view->getHeight() };
++}
++
 +} // namespace cmaj::plugin::aap
 +
 +extern "C" AndroidAudioPluginFactory* GetAndroidAudioPluginFactory()
 +{
 +    return &cmaj::plugin::aap::factory;
 +}
++
++extern "C" JNIEXPORT jintArray JNICALL
++Java_org_androidaudioplugin_ports_cmajor_CmajorPatchViewFactory_getPatchViewSize (JNIEnv* env, jclass)
++{
++    auto size = cmaj::plugin::aap::getPatchViewSize();
++
++    if (! size)
++        return nullptr;
++
++    jint values[] = { static_cast<jint> ((*size)[0]), static_cast<jint> ((*size)[1]) };
++    auto result = env->NewIntArray (2);
++    env->SetIntArrayRegion (result, 0, 2, values);
++    return result;
++}
++
++extern "C" JNIEXPORT jboolean JNICALL
++Java_org_androidaudioplugin_ports_cmajor_CmajorPatchViewFactory_attachEditor (JNIEnv*, jclass, jlong serviceInstance, jint instanceId,
++                                                                              jdouble scale, jobject parentViewGroup)
++{
++    auto wrapper = cmaj::plugin::aap::findWrapper (serviceInstance, instanceId);
++    return wrapper != nullptr && wrapper->attachEditor (parentViewGroup, scale);
++}
++
++// The UI session may outlive the plugin instance, in which case its editor is already gone.
++extern "C" JNIEXPORT void JNICALL
++Java_org_androidaudioplugin_ports_cmajor_CmajorPatchViewFactory_detachEditor (JNIEnv*, jclass, jlong serviceInstance, jint instanceId)
++{
++    if (auto wrapper = cmaj::plugin::aap::findWrapper (serviceInstance, instanceId))
++        wrapper->closeEditor();
++}
+diff --git a/modules/plugin/include/clap/cmaj_CLAPPlugin.h b/modules/plugin/include/clap/cmaj_CLAPPlugin.h
+index 5b90517..ba2db17 100644
+--- a/modules/plugin/include/clap/cmaj_CLAPPlugin.h
++++ b/modules/plugin/include/clap/cmaj_CLAPPlugin.h
+@@ -32,6 +32,11 @@
+ 
+ #include <clap/clap.h>
+ 
++#if CHOC_ANDROID
++ /// CLAP defines no Android window API; with this private one, clap_window_t::ptr is an android.view.ViewGroup.
++ #define CMAJ_CLAP_WINDOW_API_ANDROID "android"
++#endif
++
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
+@@ -1372,6 +1377,8 @@ inline bool Plugin::Impl::clapGui_isApiSupported (const char* api, bool floating
+     return ! floating && std::string_view (api) == CLAP_WINDOW_API_COCOA;
+   #elif CHOC_WINDOWS
+     return ! floating && std::string_view (api) == CLAP_WINDOW_API_WIN32;
++  #elif CHOC_ANDROID
++    return ! floating && std::string_view (api) == CMAJ_CLAP_WINDOW_API_ANDROID;
+   #else
+     (void) api;
+     (void) floating;
+@@ -1391,6 +1398,11 @@ inline bool Plugin::Impl::clapGui_getPreferredApi (const char** api, bool* float
+     *api = CLAP_WINDOW_API_WIN32;
+     *floating = false;
+ 
++    return true;
++  #elif CHOC_ANDROID
++    *api = CMAJ_CLAP_WINDOW_API_ANDROID;
++    *floating = false;
++
+     return true;
+   #else
+     (void) api;
+@@ -1458,6 +1470,8 @@ inline bool Plugin::Impl::clapGui_setParent (const clap_window_t* window)
+         return w->cocoa;
+       #elif CHOC_WINDOWS
+         return w->win32;
++      #elif CHOC_ANDROID
++        return w->ptr;
+       #else
+         (void) w;
+         return nullptr; // TODO: support linux
