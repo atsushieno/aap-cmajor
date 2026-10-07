@@ -40,10 +40,9 @@ index 0000000..f487734
 +}
 diff --git a/choc/gui/android/com/tracktion/choc/gui/ChocWebView.java b/choc/gui/android/com/tracktion/choc/gui/ChocWebView.java
 new file mode 100644
-index 0000000..082e94d
 --- /dev/null
 +++ b/choc/gui/android/com/tracktion/choc/gui/ChocWebView.java
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,211 @@
 +/*
 +    This is the Java half of choc::ui::WebView's Android backend (see
 +    choc_AndroidWebViewJNI.h and choc_WebView.h's CHOC_ANDROID branch).
@@ -77,13 +76,23 @@ index 0000000..082e94d
 +import android.content.Context;
 +import android.graphics.Bitmap;
 +import android.graphics.Color;
++import android.os.Handler;
++import android.os.Looper;
 +import android.webkit.JavascriptInterface;
 +import android.webkit.WebResourceRequest;
 +import android.webkit.WebResourceResponse;
 +import android.webkit.WebView;
 +import android.webkit.WebViewClient;
 +
-+import java.util.ArrayList;
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.nio.charset.Charset;
++import java.util.concurrent.CopyOnWriteArrayList;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++import org.json.JSONObject;
 +
 +public final class ChocWebView extends WebView
 +{
@@ -101,14 +110,35 @@ index 0000000..082e94d
 +            @Override
 +            public void onPageStarted (WebView view, String url, Bitmap favicon)
 +            {
-+                for (String script : initScripts)
-+                    view.evaluateJavascript (script, null);
++                // Fallback for pages not served by our resource callback. Owned
++                // HTML installs these synchronously before its own scripts run.
++                view.evaluateJavascript (getDocumentInitScript(), null);
 +            }
 +
 +            @Override
 +            public WebResourceResponse shouldInterceptRequest (WebView view, WebResourceRequest request)
 +            {
-+                return nativeFetchResource (nativeHandle, request.getUrl().toString());
++                WebResourceResponse response = nativeFetchResource (nativeHandle, request.getUrl().toString());
++                if (response == null || ! "text/html".equalsIgnoreCase (response.getMimeType())
++                    || response.getData() == null || initScripts.isEmpty())
++                    return response;
++
++                Charset encoding = Charset.forName (response.getEncoding() == null ? "UTF-8" : response.getEncoding());
++                try (InputStream input = response.getData())
++                {
++                    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
++                    byte[] buffer = new byte[4096];
++                    int count;
++                    while ((count = input.read (buffer)) != -1)
++                        bytes.write (buffer, 0, count);
++                    String html = new String (bytes.toByteArray(), encoding);
++                    response.setData (new ByteArrayInputStream (withInitScripts (html).getBytes (encoding)));
++                    return response;
++                }
++                catch (IOException error)
++                {
++                    throw new IllegalStateException ("Could not initialise WebView document", error);
++                }
 +            }
 +        });
 +
@@ -117,17 +147,56 @@ index 0000000..082e94d
 +
 +    public void navigate (String url)
 +    {
-+        loadUrl (url);
++        // Native construction registers bindings immediately after navigate().
++        // Defer loading until that call stack returns, even for an unattached view.
++        mainHandler.post (() -> { if (nativeHandle != 0) loadUrl (url); });
 +    }
 +
 +    public void loadHTML (String html, String baseURL)
 +    {
-+        loadDataWithBaseURL (baseURL, html, "text/html", "utf-8", null);
++        mainHandler.post (() -> {
++            if (nativeHandle != 0)
++                loadDataWithBaseURL (baseURL, withInitScripts (html), "text/html", "utf-8", null);
++        });
 +    }
 +
 +    public void addInitScript (String script)
 +    {
 +        initScripts.add (script);
++    }
++
++    private String getDocumentInitScript()
++    {
++        StringBuilder result = new StringBuilder();
++        int index = 0;
++        for (String script : initScripts)
++        {
++            // Page-start evaluation may race document creation. Deduplicate in
++            // the document itself, so an early evaluation and the HTML preamble
++            // still execute each registered script exactly once.
++            String quoted = JSONObject.quote (script).replace ("<", "\\u003c")
++                .replace ("\u2028", "\\u2028").replace ("\u2029", "\\u2029");
++            result.append ("if((window.__chocInitScriptCount||0)<=").append (index++)
++                .append ("){(0,eval)(").append (quoted)
++                .append (");window.__chocInitScriptCount=").append (index).append (";}\n");
++        }
++        return result.toString();
++    }
++
++    private String withInitScripts (String html)
++    {
++        String script = getDocumentInitScript();
++        if (script.isEmpty()) return html;
++        String preamble = "<script>" + script + "</script>";
++        Matcher head = HTML_HEAD.matcher (html);
++        int insertion = 0;
++        if (head.find()) insertion = head.end();
++        else
++        {
++            Matcher doctype = HTML_DOCTYPE.matcher (html);
++            if (doctype.find()) insertion = doctype.end();
++        }
++        return html.substring (0, insertion) + preamble + html.substring (insertion);
 +    }
 +
 +    public void runEvaluateJavascript (String script, long callbackToken)
@@ -176,7 +245,10 @@ index 0000000..082e94d
 +    }
 +
 +    private volatile long nativeHandle;
-+    private final ArrayList<String> initScripts = new ArrayList<> ();
++    private final Handler mainHandler = new Handler (Looper.getMainLooper());
++    private final CopyOnWriteArrayList<String> initScripts = new CopyOnWriteArrayList<> ();
++    private static final Pattern HTML_HEAD = Pattern.compile ("<head(?:\\s[^>]*)?>", Pattern.CASE_INSENSITIVE);
++    private static final Pattern HTML_DOCTYPE = Pattern.compile ("^\\s*<!doctype[^>]*>", Pattern.CASE_INSENSITIVE);
 +
 +    private static native void nativePostMessage (long nativeHandle, String json);
 +    private static native void nativeEvaluationResult (long nativeHandle, long callbackToken, String errorMessage, String resultJSON);
