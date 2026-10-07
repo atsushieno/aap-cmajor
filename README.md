@@ -4,8 +4,24 @@
 
 It is an experimental Cmajor integration to AAP ecosystem.
 
-This is so far a proof-of-concept demo of just loading their Pro54 patch
-as a plugin, which seems working as a valid plugin.
+It bundles Cmajor's example patches (`examples/patches`, except for FaustFM
+which needs the Faust transpiler) and runs them with Cmajor's JIT engine.
+There are two plugins, which can both play any of the patches:
+
+- "AAP Cmajor Instrument" has stereo audio outputs and starts with Pro54.
+- "AAP Cmajor Effect" also has stereo audio inputs, and starts with Tremolo.
+
+Both have MIDI 2.0 in/out. A patch's first audio input gets the stereo input
+(a mono input gets left and right mixed), and its first audio output goes to
+the stereo output (a mono output goes to both channels). Any other audio
+inputs get silence, and the instrument's patches only ever get silence.
+
+Each plugin instance plays one patch at a time. The plugin UI has two tabs:
+"Patch" shows the patch's own UI (or generic parameter controls for patches
+without one), and "Patches" switches to another patch. The selected patch and
+its state are saved in the plugin state.
+
+Loading patches from local storage is not supported yet.
 
 The code is mostly written by AI coding agents (Claude/Codex).
 

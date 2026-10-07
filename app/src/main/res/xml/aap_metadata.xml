@@ -1,9 +1,26 @@
-<plugins xmlns="urn:org.androidaudioplugin.core">
-  <plugin name="AAP Cmajor Sample" category="Instrument" developer="AAP Developers"
+<plugins xmlns="urn:org.androidaudioplugin.core"
+    xmlns:gui="urn://androidaudioplugin.org/extensions/gui">
+  <!-- Both plugins share the library and the UI, see PluginDescriptor in cmaj_AAPPlugin.cpp,
+       whose port layouts must match these. The instrument gets aap-core's default ports for
+       instruments: audio out L/R, then MIDI2 in and MIDI2 out. -->
+  <plugin name="AAP Cmajor Instrument" category="Instrument" developer="AAP Developers"
       unique-id="urn:org.androidaudioplugin/samples/cmajor/AAPCMajorSample"
       library="libaap-cmajor-sample.so"
-      gui:ui-view-factory="org.androidaudioplugin.ports.cmajor.CmajorPatchViewFactory"
-      xmlns:gui="urn://androidaudioplugin.org/extensions/gui">
+      gui:ui-view-factory="org.androidaudioplugin.ports.cmajor.CmajorPatchViewFactory">
     <extensions bom="0.12.0" />
+  </plugin>
+  <plugin name="AAP Cmajor Effect" category="Effect" developer="AAP Developers"
+      unique-id="urn:org.androidaudioplugin/samples/cmajor/AAPCmajorEffect"
+      library="libaap-cmajor-sample.so"
+      gui:ui-view-factory="org.androidaudioplugin.ports.cmajor.CmajorPatchViewFactory">
+    <extensions bom="0.12.0" />
+    <ports>
+      <port direction="input" content="audio" name="Audio In L" />
+      <port direction="input" content="audio" name="Audio In R" />
+      <port direction="output" content="audio" name="Audio Out L" />
+      <port direction="output" content="audio" name="Audio Out R" />
+      <port direction="input" content="midi2" name="MIDI In" />
+      <port direction="output" content="midi2" name="MIDI Out" />
+    </ports>
   </plugin>
 </plugins>

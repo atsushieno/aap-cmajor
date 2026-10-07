@@ -40,6 +40,7 @@ index 0000000..f487734
 +}
 diff --git a/choc/gui/android/com/tracktion/choc/gui/ChocWebView.java b/choc/gui/android/com/tracktion/choc/gui/ChocWebView.java
 new file mode 100644
+index 0000000..be0ac43
 --- /dev/null
 +++ b/choc/gui/android/com/tracktion/choc/gui/ChocWebView.java
 @@ -0,0 +1,211 @@
@@ -608,10 +609,10 @@ index 3900a07..7b9daa4 100644
  #elif CHOC_APPLE
  
 diff --git a/choc/gui/choc_MessageLoop.h b/choc/gui/choc_MessageLoop.h
-index 89d6059..da0f7b6 100644
+index 89d6059..67e8530 100644
 --- a/choc/gui/choc_MessageLoop.h
 +++ b/choc/gui/choc_MessageLoop.h
-@@ -228,6 +228,145 @@ struct Timer::Pimpl
+@@ -228,6 +228,140 @@ struct Timer::Pimpl
      guint handle;
  };
  
@@ -622,26 +623,21 @@ index 89d6059..da0f7b6 100644
 +#include <mutex>
 +#include <condition_variable>
 +#include <unordered_set>
++#include <unistd.h>
 +
 +#include "../platform/choc_AndroidMainThread.h"
 +
 +namespace choc::messageloop
 +{
 +
-+inline std::thread::id& getMainThreadIDRef()
-+{
-+    static std::thread::id i;
-+    return i;
-+}
++// The message thread is always Android's main thread, whatever thread calls initialise() (e.g.
++// cmajor's CLAP plugin calls it when it's constructed, which a plugin may do on any thread).
++inline void initialise() {}
 +
-+inline void initialise()
-+{
-+    getMainThreadIDRef() = std::this_thread::get_id();
-+}
-+
++// The main thread is the process's initial thread, whose thread ID is the process ID.
 +inline bool callerIsOnMessageThread()
 +{
-+    return getMainThreadIDRef() == std::this_thread::get_id();
++    return gettid() == getpid();
 +}
 +
 +inline void postMessage (std::function<void()>&& fn)

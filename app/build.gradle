@@ -1,5 +1,6 @@
 plugins {
     id 'com.android.application'
+    alias(libs.plugins.compose.compiler)
 }
 
 // cmajor only ships prebuilt LLVM static libs for Android/arm64 - x86_64 is only
@@ -56,6 +57,13 @@ android {
     }
     buildFeatures {
         prefab true
+        compose true
+    }
+    androidResources {
+        // assets/patches is cmajor's examples/patches. FaustFM needs the Faust transpiler,
+        // which cmajor's engine doesn't have. The rest are aapt's default patterns.
+        ignoreAssetsPatterns.addAll(["!FaustFM", "!README.md",
+            "!.svn", "!.git", "!.ds_store", "!*.scc", ".*", "<dir>_*", "!CVS", "!thumbs.db", "!picasa.ini", "!*~"])
     }
     sourceSets {
         main {
@@ -78,6 +86,7 @@ dependencies {
     implementation libs.aap.ui.compose
     implementation libs.aap.ui.compose.app
     implementation libs.aap.ui.web
+    implementation "androidx.compose.material3:material3:1.4.0"
     androidTestImplementation libs.aap.testing
     androidTestImplementation libs.test.ext.junit
     androidTestImplementation libs.androidx.rules

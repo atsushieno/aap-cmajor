@@ -26,7 +26,7 @@ index 5aad5a6..4cd4c52 100644
  
  private:
 diff --git a/include/cmajor/helpers/cmaj_PluginHelpers.h b/include/cmajor/helpers/cmaj_PluginHelpers.h
-index 6c281d0..e8f50ba 100644
+index 6c281d0..696da9f 100644
 --- a/include/cmajor/helpers/cmaj_PluginHelpers.h
 +++ b/include/cmajor/helpers/cmaj_PluginHelpers.h
 @@ -27,6 +27,10 @@
@@ -40,7 +40,28 @@ index 6c281d0..e8f50ba 100644
  #include <filesystem>
  #include <functional>
  #include <istream>
-@@ -177,6 +181,17 @@ inline bool addChildView (void* parent, void* child)
+@@ -56,6 +60,7 @@ struct Environment
+     EngineType engineType;
+     std::function<cmaj::Engine()> createEngine;
+     std::optional<VirtualFileSystem> vfs; // will default to OS filesystem
++    std::function<void(const cmaj::Patch::Status&)> statusChanged; // optional, e.g. to report build errors
+ 
+     PatchManifest makePatchManifest (const std::filesystem::path& path) const
+     {
+@@ -90,7 +95,11 @@ struct Environment
+         patch.stopPlayback = [] {};
+         patch.startPlayback = [] {};
+         patch.patchChanged = [] {};
+-        patch.statusChanged = [] (auto&&...) {};
++        if (statusChanged)
++            patch.statusChanged = statusChanged;
++        else
++            patch.statusChanged = [] (auto&&...) {};
++
+         patch.handleOutputEvent = [] (auto&&...) {};
+ 
+        #if CMAJ_USE_QUICKJS_WORKER
+@@ -177,6 +186,17 @@ inline bool addChildView (void* parent, void* child)
  
      ShowWindow (static_cast<HWND> (child), SW_SHOWNA);
      return true;
@@ -58,7 +79,7 @@ index 6c281d0..e8f50ba 100644
    #else
      (void) parent;
      (void) child;
-@@ -195,6 +210,34 @@ inline bool setViewSize (void* view, uint32_t width, uint32_t height)
+@@ -195,6 +215,34 @@ inline bool setViewSize (void* view, uint32_t width, uint32_t height)
      return true;
    #elif CHOC_WINDOWS
      return MoveWindow (static_cast<HWND> (view), 0, 0, static_cast<int> (width), static_cast<int> (height), true);
@@ -250,10 +271,10 @@ index 0000000..7e475c1
 +)
 diff --git a/modules/plugin/include/aap/cmaj_AAPPlugin.cpp b/modules/plugin/include/aap/cmaj_AAPPlugin.cpp
 new file mode 100644
-index 0000000..1b1eba0
+index 0000000..2c0b6ff
 --- /dev/null
 +++ b/modules/plugin/include/aap/cmaj_AAPPlugin.cpp
-@@ -0,0 +1,902 @@
+@@ -0,0 +1,1593 @@
 +//
 +//     ,ad888ba,                              88
 +//    d8"'    "8b
@@ -281,11 +302,14 @@ index 0000000..1b1eba0
 +// fairly directly - prepare/activate/process/deactivate on the AAP side become
 +// activate/start_processing/process/stop_processing on the CLAP side.
 +//
-+// It loads the Pro54 example patch from the APK assets, run by cmajor's JIT engine at
-+// runtime (no ahead-of-time codegen needed). It handles audio ports, parameters (exposed
++// It provides two plugins, an instrument and an effect (see PluginDescriptor). Each plugin
++// instance runs one patch from the APK assets at a time (Pro54 or Tremolo by default), built
++// by cmajor's JIT engine at runtime (no ahead-of-time codegen needed), and can switch to
++// another one (see Wrapper::loadPatch()). It handles audio ports, parameters (exposed
 +// through AAP's parameters extension, with parameter changes arriving as AAP parameter
-+// SysEx8 on the MIDI2 input port) and MIDI channel messages, and embeds the patch's own view
-+// as the AAP native UI (see CmajorPatchViewFactory.java) - no state save/load yet.
++// SysEx8 on the MIDI2 input port), MIDI channel messages and state (the patch, plus
++// cmajor's own state of it), and embeds the patch's own view as the AAP native UI (see
++// CmajorPatchViewFactory.kt).
 +
 +#include "../clap/cmaj_CLAPPlugin.h"
 +
@@ -294,6 +318,7 @@ index 0000000..1b1eba0
 +#include "choc/platform/choc_AndroidJNIHelpers.h"
 +#include <aap/ext/parameters.h>
 +#include <aap/ext/midi.h>
++#include <aap/ext/state.h>
 +#include <aap/core/host/plugin-host.h>
 +#include <android/asset_manager_jni.h>
 +
@@ -303,6 +328,9 @@ index 0000000..1b1eba0
 +#include <cstring>
 +#include <memory>
 +#include <mutex>
++#include <numeric>
++#include <optional>
++#include <string_view>
 +#include <unordered_map>
 +#include <vector>
 +
@@ -310,10 +338,105 @@ index 0000000..1b1eba0
 +{
 +
 +//==============================================================================
-+// The patch is loaded from the APK assets, where the app bundles the Pro54 example patch
-+// folder (see app/src/main/assets/patches).
-+static const std::filesystem::path patchAssetFolder = "patches/Pro54";
-+static constexpr const char* patchManifestFile = "Pro54.cmajorpatch";
++// A patch is identified by a URI. So far all of them are bundled in the APK assets (the app
++// bundles cmajor's examples/patches as assets/patches), e.g.
++// "cmajor-asset:///patches/Pro54/Pro54.cmajorpatch".
++static constexpr std::string_view assetPatchScheme = "cmajor-asset:///";
++
++//==============================================================================
++// The app has two AAP plugins sharing all of this code: an instrument, and an effect that
++// also has audio inputs. Their ports must match aap_metadata.xml (where the instrument gets
++// aap-core's default port layout for instruments).
++struct PortInfo
++{
++    uint32_t index;
++    const char* name;
++    aap_port_direction direction;
++};
++
++struct PluginDescriptor
++{
++    const char* pluginID;
++    const char* localName;
++    const char* displayName;
++    const char* category;
++    const char* defaultPatchIdentity;
++
++    // AAP port indices, -1 where there's no such port
++    int32_t audioInLeft, audioInRight;
++    uint32_t audioOutLeft, audioOutRight, midi2In, midi2Out;
++
++    std::vector<PortInfo> audioPorts;
++};
++
++static const PluginDescriptor instrumentPlugin
++{
++    "urn:org.androidaudioplugin/samples/cmajor/AAPCMajorSample",
++    "AAPCMajorSample",
++    "AAP Cmajor Instrument",
++    "Instrument",
++    "cmajor-asset:///patches/Pro54/Pro54.cmajorpatch",
++    -1, -1, 0, 1, 2, 3,
++    {
++        { 0, "Audio Out L", AAP_PORT_DIRECTION_OUTPUT },
++        { 1, "Audio Out R", AAP_PORT_DIRECTION_OUTPUT }
++    }
++};
++
++static const PluginDescriptor effectPlugin
++{
++    "urn:org.androidaudioplugin/samples/cmajor/AAPCmajorEffect",
++    "AAPCmajorEffect",
++    "AAP Cmajor Effect",
++    "Effect",
++    "cmajor-asset:///patches/Tremolo/Tremolo.cmajorpatch",
++    0, 1, 2, 3, 4, 5,
++    {
++        { 0, "Audio In L",  AAP_PORT_DIRECTION_INPUT },
++        { 1, "Audio In R",  AAP_PORT_DIRECTION_INPUT },
++        { 2, "Audio Out L", AAP_PORT_DIRECTION_OUTPUT },
++        { 3, "Audio Out R", AAP_PORT_DIRECTION_OUTPUT }
++    }
++};
++
++inline const PluginDescriptor* findPluginDescriptor (std::string_view pluginID)
++{
++    for (auto descriptor : { std::addressof (instrumentPlugin), std::addressof (effectPlugin) })
++        if (pluginID == descriptor->pluginID)
++            return descriptor;
++
++    return nullptr;
++}
++
++struct PatchLocation
++{
++    std::filesystem::path assetFolder;
++    std::filesystem::path manifestFile;
++};
++
++// The path relative to its root, as long as it doesn't escape from there.
++inline std::optional<std::filesystem::path> toContainedRelativePath (const std::filesystem::path& path)
++{
++    auto result = path.relative_path().lexically_normal();
++
++    if (result.empty() || *result.begin() == "..")
++        return {};
++
++    return result;
++}
++
++inline std::optional<PatchLocation> resolvePatchIdentity (std::string_view identity)
++{
++    if (identity.substr (0, assetPatchScheme.size()) != assetPatchScheme)
++        return {};
++
++    auto path = toContainedRelativePath (std::string (identity.substr (assetPatchScheme.size())));
++
++    if (! path || path->extension() != ".cmajorpatch")
++        return {};
++
++    return PatchLocation { path->parent_path(), path->filename() };
++}
 +
 +// The Java AssetManager must outlive the native one obtained from it, so its global
 +// reference is deliberately never released.
@@ -343,22 +466,25 @@ index 0000000..1b1eba0
 +    return assetManager;
 +}
 +
-+inline AAsset* openPatchAsset (const std::filesystem::path& path, int mode)
++inline AAsset* openPatchAsset (const PatchLocation& location, const std::filesystem::path& path, int mode)
 +{
 +    auto assetManager = getAssetManager();
++    auto relativePath = toContainedRelativePath (path);
 +
-+    if (assetManager == nullptr)
++    if (assetManager == nullptr || ! relativePath)
 +        return nullptr;
 +
-+    auto assetPath = (patchAssetFolder / path.relative_path()).lexically_normal().generic_string();
++    auto assetPath = (location.assetFolder / *relativePath).generic_string();
 +    return AAssetManager_open (assetManager, assetPath.c_str(), mode);
 +}
 +
-+inline cmaj::plugin::Environment createEnvironment()
++using StatusCallback = std::function<void(const cmaj::Patch::Status&)>;
++
++inline cmaj::plugin::Environment createEnvironment (const PatchLocation& location, StatusCallback statusChanged = {})
 +{
-+    auto readFile = [] (const std::filesystem::path& path) -> std::unique_ptr<std::istream>
++    auto readFile = [location] (const std::filesystem::path& path) -> std::unique_ptr<std::istream>
 +    {
-+        auto asset = openPatchAsset (path, AASSET_MODE_BUFFER);
++        auto asset = openPatchAsset (location, path, AASSET_MODE_BUFFER);
 +
 +        if (asset == nullptr)
 +            return {};
@@ -372,9 +498,9 @@ index 0000000..1b1eba0
 +        return result;
 +    };
 +
-+    auto fileExists = [] (const std::filesystem::path& path)
++    auto fileExists = [location] (const std::filesystem::path& path)
 +    {
-+        auto asset = openPatchAsset (path, AASSET_MODE_UNKNOWN);
++        auto asset = openPatchAsset (location, path, AASSET_MODE_UNKNOWN);
 +
 +        if (asset == nullptr)
 +            return false;
@@ -383,6 +509,8 @@ index 0000000..1b1eba0
 +        return true;
 +    };
 +
++    // Asset files never change, so the fixed modification time keeps the JIT engine from
++    // ever rebuilding the patch by itself.
 +    return
 +    {
 +        cmaj::plugin::Environment::EngineType::JIT,
@@ -393,16 +521,44 @@ index 0000000..1b1eba0
 +            [] (const std::filesystem::path& path) { return path; },
 +            [] (const std::filesystem::path&) -> std::filesystem::file_time_type { return {}; },
 +            fileExists
-+        }
++        },
++        std::move (statusChanged)
 +    };
++}
++
++//==============================================================================
++// What the manifest says about a patch, which is available without building it.
++struct PatchDescription
++{
++    std::string name;
++
++    // The size of the patch's own view in CSS pixels (zero where the view doesn't say), if it has one.
++    std::optional<std::array<uint32_t, 2>> viewSize;
++};
++
++inline std::optional<PatchDescription> describePatch (const PatchLocation& location)
++{
++    auto manifest = createEnvironment (location).makePatchManifest (location.manifestFile);
++
++    if (! manifest.manifest.isObject())
++        return {};
++
++    PatchDescription result;
++    result.name = manifest.name.empty() ? location.manifestFile.stem().string() : manifest.name;
++
++    if (auto view = manifest.findDefaultView(); view != nullptr && ! view->getSource().empty())
++        result.viewSize = std::array<uint32_t, 2> { view->getWidth(), view->getHeight() };
++
++    return result;
 +}
 +
 +//==============================================================================
 +// cmajor's CLAP plugin only publishes its audio ports (and so only wires up its channel
 +// buffers in process()) when the host claims to support CLAP_AUDIO_PORTS_RESCAN_LIST -
 +// in the JIT case it otherwise leaves the port list empty, and then reads the input
-+// channels from null pointers. Our ports are fixed and our patch never changes after
-+// loading, so we can just say yes and treat any rescan request as a no-op.
++// channels from null pointers. Our ports are fixed and a CLAP plugin never changes its
++// patch after loading (we replace the whole plugin instead), so we can just say yes and
++// treat any rescan request as a no-op.
 +static const clap_host_audio_ports_t hostAudioPorts
 +{
 +    [] (const clap_host_t*, uint32_t) -> bool { return true; },
@@ -438,12 +594,12 @@ index 0000000..1b1eba0
 +    }
 +};
 +
-+// The CLAP plugin keeps references to these, and may outlive its Wrapper (see ~Wrapper()).
++// The CLAP plugins keep references to these, and may outlive their Wrapper (see retirePatch()).
 +static const Host sharedHost;
 +static const clap_plugin_descriptor_t sharedDescriptor {};
 +
 +//==============================================================================
-+// The loaded patch's parameters, as reported by the CLAP plugin. The AAP parameter ID of each
++// A loaded patch's parameters, as reported by its CLAP plugin. The AAP parameter ID of each
 +// parameter is its index in this list (cmajor's CLAP parameter IDs are not guaranteed to fit
 +// into AAP's 0-16383 ID range).
 +struct ParameterTable
@@ -459,43 +615,294 @@ index 0000000..1b1eba0
 +    clap_event_midi_t midi;
 +};
 +
-+//==============================================================================
-+struct Wrapper
++// The last build error that cmajor reported for a patch. cmajor may report it from any thread.
++struct BuildLog
 +{
-+    Wrapper (AndroidAudioPluginHost* hostToUse)
-+        : aapHost (hostToUse),
-+          plugin (cmaj::plugin::clap::create (sharedDescriptor, sharedHost, patchManifestFile, createEnvironment()))
++    void update (const cmaj::Patch::Status& status)
++    {
++        if (! status.messageList.hasErrors())
++            return;
++
++        std::lock_guard<std::mutex> l (lock);
++        lastError = status.statusMessage;
++    }
++
++    std::string getLastError()
++    {
++        std::lock_guard<std::mutex> l (lock);
++        return lastError;
++    }
++
++private:
++    std::mutex lock;
++    std::string lastError;
++};
++
++//==============================================================================
++// Connects a patch's audio ports to the plugin's stereo ports. The CLAP plugin expects a buffer
++// for each of the patch's audio ports, with the patch's own channel count. The first input port
++// gets the plugin's audio input (a mono one gets L and R mixed), the first output port goes to the
++// plugin's audio output (a mono one goes to both L and R), and other channels are fed with
++// silence or discarded.
++struct AudioRouting
++{
++    void build (const clap_plugin& plugin, uint32_t maxFramesToUse)
++    {
++        maxFrames = maxFramesToUse;
++        silence.assign (maxFrames, 0.0f);
++        discarded.assign (maxFrames, 0.0f);
++        monoMix.assign (maxFrames, 0.0f);
++
++        auto audioPorts = static_cast<const clap_plugin_audio_ports_t*> (plugin.get_extension (std::addressof (plugin), CLAP_EXT_AUDIO_PORTS));
++
++        auto getChannelCounts = [&] (bool isInput)
++        {
++            std::vector<uint32_t> counts;
++            auto numPorts = audioPorts != nullptr ? audioPorts->count (std::addressof (plugin), isInput) : 0;
++
++            for (uint32_t i = 0; i < numPorts; ++i)
++            {
++                clap_audio_port_info_t info {};
++                counts.push_back (audioPorts->get (std::addressof (plugin), i, isInput, std::addressof (info)) ? info.channel_count : 0);
++            }
++
++            return counts;
++        };
++
++        auto createBuffers = [] (const std::vector<uint32_t>& channelCounts, std::vector<float*>& channels,
++                                 std::vector<clap_audio_buffer_t>& buffers, float* defaultChannel)
++        {
++            channels.assign (std::accumulate (channelCounts.begin(), channelCounts.end(), size_t()), defaultChannel);
++            buffers.clear();
++            auto next = channels.data();
++
++            for (auto count : channelCounts)
++            {
++                buffers.push_back ({ next, nullptr, count, 0, 0 });
++                next += count;
++            }
++        };
++
++        auto inputCounts = getChannelCounts (true);
++        auto outputCounts = getChannelCounts (false);
++        createBuffers (inputCounts, inputChannels, inputs, silence.data());
++        createBuffers (outputCounts, outputChannels, outputs, discarded.data());
++        numMainInputChannels = inputCounts.empty() ? 0 : inputCounts.front();
++        numMainOutputChannels = outputCounts.empty() ? 0 : outputCounts.front();
++    }
++
++    // Audio thread: points the patch's main channels at the plugin's buffers (any of which may be null).
++    void connect (const float* inL, const float* inR, float* outL, float* outR, uint32_t numFrames)
++    {
++        auto orSilence = [this] (const float* channel) { return const_cast<float*> (channel != nullptr ? channel : silence.data()); };
++
++        if (numMainInputChannels >= 2)
++        {
++            inputChannels[0] = orSilence (inL);
++            inputChannels[1] = orSilence (inR);
++        }
++        else if (numMainInputChannels == 1)
++        {
++            if (inL != nullptr && inR != nullptr)
++            {
++                for (uint32_t i = 0; i < numFrames; ++i)
++                    monoMix[i] = 0.5f * (inL[i] + inR[i]);
++
++                inputChannels[0] = monoMix.data();
++            }
++            else
++            {
++                inputChannels[0] = orSilence (inL != nullptr ? inL : inR);
++            }
++        }
++
++        if (numMainOutputChannels >= 1)
++            outputChannels[0] = outL != nullptr ? outL : discarded.data();
++
++        if (numMainOutputChannels >= 2)
++            outputChannels[1] = outR != nullptr ? outR : discarded.data();
++    }
++
++    // Audio thread: fills the plugin's output channels that the patch didn't write to.
++    void completeOutput (float* outL, float* outR, uint32_t numFrames)
++    {
++        if (numMainOutputChannels == 0)
++        {
++            for (auto channel : { outL, outR })
++                if (channel != nullptr)
++                    std::fill_n (channel, numFrames, 0.0f);
++        }
++        else if (numMainOutputChannels == 1 && outL != nullptr && outR != nullptr)
++        {
++            std::copy_n (outL, numFrames, outR);
++        }
++    }
++
++    uint32_t maxFrames = 0;
++    std::vector<clap_audio_buffer_t> inputs, outputs;
++
++private:
++    std::vector<float*> inputChannels, outputChannels;
++    uint32_t numMainInputChannels = 0, numMainOutputChannels = 0;
++    std::vector<float> silence, discarded, monoMix;
++};
++
++//==============================================================================
++// One patch, run by its own cmajor CLAP plugin. A Wrapper switches patches by replacing its
++// LoadedPatch as a whole.
++struct LoadedPatch
++{
++    LoadedPatch (std::string identityToUse, const PatchLocation& location, PatchDescription descriptionToUse)
++        : identity (std::move (identityToUse)),
++          description (std::move (descriptionToUse)),
++          buildLog (std::make_shared<BuildLog>()),
++          plugin (cmaj::plugin::clap::create (sharedDescriptor, sharedHost, location.manifestFile,
++                                              createEnvironment (location, [log = buildLog] (const auto& status) { log->update (status); })))
 +    {
 +        if (plugin != nullptr)
 +            initialised = plugin->init (plugin.get());
 +    }
 +
-+    ~Wrapper()
++    // Only ever called on the main thread (see retirePatch()).
++    ~LoadedPatch()
 +    {
 +        if (plugin == nullptr)
 +            return;
 +
-+        if (processing)
-+            plugin->stop_processing (plugin.get());
++        deactivate();
++        closeEditor();
++    }
 +
-+        if (active)
++    bool isValid() const  { return plugin != nullptr && initialised; }
++
++    //==============================================================================
++    // The JIT engine only builds the patch (and so only knows its parameters and audio ports)
++    // when the CLAP plugin is activated. AAP's activate()/deactivate() must be realtime-safe,
++    // so the CLAP plugin starts processing right away, and the AAP side is gated in process().
++    bool activate (double sampleRate, uint32_t maxFrames)
++    {
++        deactivate();
++
++        if (! plugin->activate (plugin.get(), sampleRate, 1, maxFrames))
++            return false;
++
++        if (! plugin->start_processing (plugin.get()))
++        {
 +            plugin->deactivate (plugin.get());
++            return false;
++        }
 +
-+        // The editor's WebView must be destroyed on the main thread, and the plugin with it.
-+        if (editorOpen && ! choc::messageloop::callerIsOnMessageThread())
-+            choc::messageloop::postMessage ([p = std::shared_ptr<clap_plugin> (std::move (plugin))] { destroyEditor (*p); });
-+        else if (editorOpen)
-+            destroyEditor (*plugin);
++        active = true;
++        audioRouting.build (*plugin, maxFrames);
++        return true;
++    }
++
++    void deactivate()
++    {
++        if (! active)
++            return;
++
++        plugin->stop_processing (plugin.get());
++        plugin->deactivate (plugin.get());
++        active = false;
++    }
++
++    std::string getBuildError() const
++    {
++        auto error = buildLog->getLastError();
++        return error.empty() ? "Could not build " + description.name : error;
++    }
++
++    //==============================================================================
++    std::unique_ptr<ParameterTable> createParameterTable() const
++    {
++        auto table = std::make_unique<ParameterTable>();
++
++        if (auto params = static_cast<const clap_plugin_params_t*> (plugin->get_extension (plugin.get(), CLAP_EXT_PARAMS)))
++        {
++            auto count = std::min<uint32_t> (params->count (plugin.get()), 16384);
++
++            for (uint32_t i = 0; i < count; ++i)
++            {
++                clap_param_info_t info {};
++
++                if (params->get_info (plugin.get(), i, std::addressof (info)))
++                {
++                    table->indexByID[info.id] = static_cast<uint16_t> (table->infos.size());
++                    table->infos.push_back (info);
++                }
++            }
++        }
++
++        return table;
++    }
++
++    //==============================================================================
++    // cmajor's own state of the patch (its parameter values and stored values), as JSON.
++    std::optional<std::string> saveState() const
++    {
++        auto state = static_cast<const clap_plugin_state_t*> (plugin->get_extension (plugin.get(), CLAP_EXT_STATE));
++
++        if (state == nullptr)
++            return {};
++
++        std::string result;
++
++        clap_ostream_t stream
++        {
++            std::addressof (result),
++            [] (const clap_ostream_t* s, const void* data, uint64_t size) -> int64_t
++            {
++                static_cast<std::string*> (s->ctx)->append (static_cast<const char*> (data), static_cast<size_t> (size));
++                return static_cast<int64_t> (size);
++            }
++        };
++
++        if (! state->save (plugin.get(), std::addressof (stream)))
++            return {};
++
++        return result;
++    }
++
++    // If the patch hasn't been built yet, cmajor applies the state once it is.
++    bool loadState (const std::string& data)
++    {
++        auto state = static_cast<const clap_plugin_state_t*> (plugin->get_extension (plugin.get(), CLAP_EXT_STATE));
++
++        if (state == nullptr || data.empty())
++            return false;
++
++        struct Reader
++        {
++            const std::string& data;
++            size_t position = 0;
++        };
++
++        Reader reader { data };
++
++        clap_istream_t stream
++        {
++            std::addressof (reader),
++            [] (const clap_istream_t* s, void* buffer, uint64_t size) -> int64_t
++            {
++                auto& r = *static_cast<Reader*> (s->ctx);
++                auto count = static_cast<size_t> (std::min<uint64_t> (size, r.data.size() - r.position));
++                std::memcpy (buffer, r.data.data() + r.position, count);
++                r.position += count;
++                return static_cast<int64_t> (count);
++            }
++        };
++
++        return state->load (plugin.get(), std::addressof (stream));
 +    }
 +
 +    //==============================================================================
 +    // GUI (main thread only)
 +    bool attachEditor (jobject parentViewGroup, double scale)
 +    {
-+        if (editorOpen)
-+            closeEditor();
++        closeEditor();
 +
-+        auto gui = getGUI (*plugin);
++        auto gui = getGUI();
 +
 +        if (gui == nullptr || ! gui->create (plugin.get(), CMAJ_CLAP_WINDOW_API_ANDROID, false))
 +            return false;
@@ -519,112 +926,281 @@ index 0000000..1b1eba0
 +
 +    void closeEditor()
 +    {
-+        if (editorOpen)
-+            destroyEditor (*plugin);
++        if (! editorOpen)
++            return;
++
++        if (auto gui = getGUI())
++            gui->destroy (plugin.get());
 +
 +        editorOpen = false;
 +    }
 +
-+    static const clap_plugin_gui_t* getGUI (const clap_plugin& p)
++    const clap_plugin_gui_t* getGUI() const
 +    {
-+        return static_cast<const clap_plugin_gui_t*> (p.get_extension (std::addressof (p), CLAP_EXT_GUI));
++        return static_cast<const clap_plugin_gui_t*> (plugin->get_extension (plugin.get(), CLAP_EXT_GUI));
 +    }
 +
-+    static void destroyEditor (const clap_plugin& p)
-+    {
-+        if (auto gui = getGUI (p))
-+            gui->destroy (std::addressof (p));
-+    }
-+
-+    bool isValid() const  { return plugin != nullptr && initialised; }
-+
-+    // The JIT engine only loads the patch (and hence knows its parameters) when the CLAP plugin
-+    // is activated, i.e. at AAP prepare(). So the parameter list is (re)built there, and the AAP
-+    // host is told to rescan it.
-+    void rebuildParameterTable()
-+    {
-+        auto table = std::make_unique<ParameterTable>();
-+
-+        if (auto params = static_cast<const clap_plugin_params_t*> (plugin->get_extension (plugin.get(), CLAP_EXT_PARAMS)))
-+        {
-+            auto count = std::min<uint32_t> (params->count (plugin.get()), 16384);
-+
-+            for (uint32_t i = 0; i < count; ++i)
-+            {
-+                clap_param_info_t info {};
-+
-+                if (params->get_info (plugin.get(), i, std::addressof (info)))
-+                {
-+                    table->indexByID[info.id] = static_cast<uint16_t> (table->infos.size());
-+                    table->infos.push_back (info);
-+                }
-+            }
-+        }
-+
-+        // Published tables are never freed while the plugin is alive, since the host may be
-+        // reading the previous one on another thread (and the audio thread reads it lock-free).
-+        std::lock_guard<std::mutex> lock (parameterTablesMutex);
-+        parameterTable.store (table.get(), std::memory_order_release);
-+        parameterTables.push_back (std::move (table));
-+    }
-+
-+    // AAP instruments have no audio inputs, but a patch may still have some (Pro54 has an
-+    // external audio input), so they are fed with silence.
-+    void rebuildSilentInputs (uint32_t maxFrames)
-+    {
-+        silentInputs.clear();
-+        silentChannels.clear();
-+        silence.assign (maxFrames, 0.0f);
-+
-+        auto audioPorts = static_cast<const clap_plugin_audio_ports_t*> (plugin->get_extension (plugin.get(), CLAP_EXT_AUDIO_PORTS));
-+        auto numPorts = audioPorts != nullptr ? audioPorts->count (plugin.get(), true) : 0;
-+        std::vector<uint32_t> channelCounts;
-+
-+        for (uint32_t i = 0; i < numPorts; ++i)
-+        {
-+            clap_audio_port_info_t info {};
-+            channelCounts.push_back (audioPorts->get (plugin.get(), i, true, std::addressof (info)) ? info.channel_count : 0);
-+        }
-+
-+        for (auto count : channelCounts)
-+            silentChannels.insert (silentChannels.end(), count, silence.data());
-+
-+        auto channels = silentChannels.data();
-+
-+        for (auto count : channelCounts)
-+        {
-+            silentInputs.push_back ({ channels, nullptr, count, 0, 0 });
-+            channels += count;
-+        }
-+    }
-+
-+    const ParameterTable* getParameterTable() const  { return parameterTable.load (std::memory_order_acquire); }
-+
-+    void notifyParameterLayoutChanged()
-+    {
-+        if (aapHost == nullptr || aapHost->get_extension == nullptr)
-+            return;
-+
-+        if (auto ext = static_cast<aap_parameters_host_extension_t*> (aapHost->get_extension (aapHost, AAP_PARAMETERS_EXTENSION_URI)))
-+            if (ext->notify_parameters_changed != nullptr)
-+                ext->notify_parameters_changed (ext, aapHost);
-+    }
-+
-+    AndroidAudioPluginHost* aapHost;
++    //==============================================================================
++    const std::string identity;
++    const PatchDescription description;
++    std::shared_ptr<BuildLog> buildLog;
 +    cmaj::plugin::clap::PluginPtr plugin;
 +
 +    bool initialised = false;
 +    bool active = false;
-+    bool processing = false;
 +    std::atomic<bool> editorOpen { false };
 +
-+    std::mutex parameterTablesMutex;
-+    std::vector<std::unique_ptr<ParameterTable>> parameterTables;
-+    std::atomic<const ParameterTable*> parameterTable { nullptr };
++    AudioRouting audioRouting;
++};
 +
-+    std::vector<float> silence;
-+    std::vector<float*> silentChannels;
-+    std::vector<clap_audio_buffer_t> silentInputs;
++// Patches are destroyed on the main thread, since their WebView must be, and their patch worker's
++// JavaScript timers run there. The posted function, and the patch with it, is deleted there too.
++inline void retirePatch (std::unique_ptr<LoadedPatch> patch)
++{
++    if (patch == nullptr || choc::messageloop::callerIsOnMessageThread())
++        return;
++
++    choc::messageloop::postMessage ([p = std::shared_ptr<LoadedPatch> (std::move (patch))] {});
++}
++
++//==============================================================================
++// One AAP plugin instance. It always has a patch identity (Pro54 at first), but only builds
++// the patch once it knows the sample rate and block size, i.e. at prepare(); until then,
++// `current` is null.
++//
++// Locking (always in this order): loadMutex serialises building patches, which can take
++// seconds; patchMutex guards switching `current` and everything the UI reads, and is only
++// held briefly; processMutex is held by process(), and the audio thread only ever try-locks
++// it, outputting silence for the few blocks during which a patch is being switched.
++struct Wrapper
++{
++    Wrapper (const PluginDescriptor& descriptorToUse, AndroidAudioPluginHost* hostToUse)
++        : descriptor (descriptorToUse), aapHost (hostToUse), currentIdentity (descriptor.defaultPatchIdentity)
++    {
++        if (auto location = resolvePatchIdentity (currentIdentity))
++            currentDescription = describePatch (*location);
++
++        publishParameterTable (std::make_unique<ParameterTable>());
++    }
++
++    ~Wrapper()
++    {
++        retirePatch (std::move (current));
++    }
++
++    //==============================================================================
++    // Switches to the patch, building it if the plugin has been prepared. It blocks for as long
++    // as building takes, so call it from a background thread where possible; the current patch
++    // keeps playing in the meantime. If the patch can't be loaded, `keepCurrentPatchOnFailure`
++    // decides whether to keep the current patch, or to switch to having none.
++    // Returns an error message, or an empty string on success.
++    std::string loadPatch (const std::string& identity, std::optional<std::string> cmajorState, bool keepCurrentPatchOnFailure)
++    {
++        std::lock_guard<std::mutex> loadLock (loadMutex);
++
++        auto location = resolvePatchIdentity (identity);
++        auto description = location ? describePatch (*location) : std::nullopt;
++        std::string error;
++        std::unique_ptr<LoadedPatch> next;
++
++        if (! description)
++            error = "Patch not found: " + identity;
++        else if (prepared)
++            next = buildPatch (identity, *location, *description, cmajorState, error);
++
++        if (! error.empty() && keepCurrentPatchOnFailure)
++        {
++            std::lock_guard<std::mutex> patchLock (patchMutex);
++            lastError = error;
++            ++revision;
++            return error;
++        }
++
++        publish (std::move (next), identity, std::move (description), std::move (cmajorState), error);
++        return error;
++    }
++
++    // (Re)builds the current patch for the new sample rate and block size, carrying its state over.
++    void prepare (double newSampleRate, uint32_t newMaxFrames)
++    {
++        std::lock_guard<std::mutex> loadLock (loadMutex);
++
++        if (prepared && sampleRate == newSampleRate && maxFrames == newMaxFrames && current != nullptr)
++            return;
++
++        sampleRate = newSampleRate;
++        maxFrames = newMaxFrames;
++        prepared = true;
++
++        std::string identity;
++        std::optional<PatchDescription> description;
++        std::optional<std::string> state;
++
++        {
++            std::lock_guard<std::mutex> patchLock (patchMutex);
++            identity = currentIdentity;
++            description = currentDescription;
++            state = current != nullptr ? current->saveState() : pendingState;
++        }
++
++        auto location = resolvePatchIdentity (identity);
++        std::string error;
++        std::unique_ptr<LoadedPatch> next;
++
++        if (! location || ! description)
++            error = "Patch not found: " + identity;
++        else
++            next = buildPatch (identity, *location, *description, state, error);
++
++        publish (std::move (next), identity, std::move (description), std::move (state), error);
++    }
++
++    //==============================================================================
++    std::string getState()
++    {
++        std::lock_guard<std::mutex> patchLock (patchMutex);
++        auto cmajorState = current != nullptr ? current->saveState() : pendingState;
++
++        auto state = choc::value::createObject ({},
++                                                "aapCmajorStateVersion", 1,
++                                                "patch", currentIdentity);
++
++        if (cmajorState)
++            state.addMember ("cmajorState", *cmajorState);
++
++        return choc::json::toString (state, false);
++    }
++
++    void setState (std::string_view serialised)
++    {
++        std::string identity;
++        std::optional<std::string> cmajorState;
++
++        try
++        {
++            auto state = choc::json::parse (serialised);
++
++            if (! state.isObject() || ! state["patch"].isString())
++                return;
++
++            identity = std::string (state["patch"].getString());
++
++            if (state["cmajorState"].isString())
++                cmajorState = std::string (state["cmajorState"].getString());
++        }
++        catch (...)
++        {
++            return;
++        }
++
++        {
++            std::lock_guard<std::mutex> patchLock (patchMutex);
++
++            if (current != nullptr && current->identity == identity)
++            {
++                if (cmajorState)
++                    current->loadState (*cmajorState);
++
++                return;
++            }
++        }
++
++        // A restored state shouldn't sound like a different patch, so if the patch can't be
++        // loaded, the plugin goes silent (still remembering the patch and its state).
++        loadPatch (identity, std::move (cmajorState), false);
++    }
++
++    // get_state_size() and get_state() are separate calls, between which the state may change.
++    // get_state() always saves the latest state, but if that doesn't fit into the space the host
++    // allocated for the size it was told, it falls back to the state saved for get_state_size().
++    size_t getStateSize()
++    {
++        auto state = getState();
++        std::lock_guard<std::mutex> l (stateForSizeMutex);
++        stateForSize = std::move (state);
++        return stateForSize.size();
++    }
++
++    void getState (aap_state_t& destination)
++    {
++        auto state = getState();
++
++        {
++            std::lock_guard<std::mutex> l (stateForSizeMutex);
++
++            if (state.size() > destination.data_size && ! stateForSize.empty() && stateForSize.size() <= destination.data_size)
++                state = stateForSize;
++
++            stateForSize.clear();
++        }
++
++        auto size = std::min (state.size(), destination.data_size);
++        std::memcpy (destination.data, state.data(), size);
++        destination.data_size = size;
++    }
++
++    //==============================================================================
++    // UI support (main thread)
++
++    // Returns the generation of the patch whose editor was attached, or -1 if there's no editor.
++    int32_t attachEditor (jobject parentViewGroup, double scale)
++    {
++        std::lock_guard<std::mutex> patchLock (patchMutex);
++
++        if (current == nullptr || ! current->attachEditor (parentViewGroup, scale))
++            return -1;
++
++        return static_cast<int32_t> (generation);
++    }
++
++    // Once the patch has been switched, the old patch's editor is closed by retirePatch().
++    void detachEditor (int32_t editorGeneration)
++    {
++        std::lock_guard<std::mutex> patchLock (patchMutex);
++
++        if (current != nullptr && static_cast<int32_t> (generation) == editorGeneration)
++            current->closeEditor();
++    }
++
++    std::optional<std::array<uint32_t, 2>> getViewSize()
++    {
++        std::lock_guard<std::mutex> patchLock (patchMutex);
++        return currentDescription ? currentDescription->viewSize : std::nullopt;
++    }
++
++    // `generation` changes whenever the patch changes, `revision` whenever anything here does.
++    std::string getStatus()
++    {
++        std::lock_guard<std::mutex> patchLock (patchMutex);
++
++        auto status = choc::value::createObject ({},
++                                                 "identity", currentIdentity,
++                                                 "loaded", current != nullptr,
++                                                 "building", building.load(),
++                                                 "error", lastError,
++                                                 "generation", static_cast<int64_t> (generation),
++                                                 "revision", static_cast<int64_t> (revision),
++                                                 "parameterCount", static_cast<int32_t> (getParameterTable()->infos.size()));
++
++        if (currentDescription)
++        {
++            status.addMember ("name", currentDescription->name);
++            status.addMember ("hasView", currentDescription->viewSize.has_value());
++        }
++
++        return choc::json::toString (status, false);
++    }
++
++    //==============================================================================
++    const ParameterTable* getParameterTable() const  { return parameterTable.load (std::memory_order_acquire); }
++
++    const PluginDescriptor& descriptor;
++    AndroidAudioPluginHost* aapHost;
++    std::atomic<bool> released { false };
++    std::atomic<bool> hostActive { false };
++
++    std::mutex processMutex;
++    std::unique_ptr<LoadedPatch> current;
 +
 +    // audio thread only: events found in the current block's MIDI2 input
 +    std::array<InputEvent, 256> pendingEvents {};
@@ -633,66 +1209,121 @@ index 0000000..1b1eba0
 +    // audio thread only: the current block's MIDI2 output
 +    AAPMidiBufferHeader* midiOut = nullptr;
 +    uint32_t midiOutCapacity = 0;
-+};
 +
-+//==============================================================================
-+// Port layout: we don't declare ports in aap_metadata.xml, so aap-core applies its default
-+// layout for instruments: audio out L/R, then MIDI2 in and MIDI2 out.
-+enum Port : uint32_t
-+{
-+    audioOutLeft  = 0,
-+    audioOutRight = 1,
-+    midi2In       = 2,
-+    midi2Out      = 3,
-+    numAudioPorts = 2
-+};
-+
-+struct PortInfo
-+{
-+    uint32_t index;
-+    const char* name;
-+};
-+
-+static constexpr PortInfo ports[] =
-+{
-+    { Port::audioOutLeft,  "Audio Out L" },
-+    { Port::audioOutRight, "Audio Out R" },
-+};
-+
-+void aapPrepare (AndroidAudioPlugin* plugin, int32_t sampleRate, aap_buffer_t* buffer)
-+{
-+    auto& wrapper = *static_cast<Wrapper*> (plugin->plugin_specific);
-+
-+    if (wrapper.active)
++private:
++    //==============================================================================
++    // Creates the patch and builds it (which compiles it, and takes a while).
++    std::unique_ptr<LoadedPatch> buildPatch (const std::string& identity, const PatchLocation& location, const PatchDescription& description,
++                                             const std::optional<std::string>& cmajorState, std::string& error)
 +    {
-+        if (wrapper.processing)
++        building = true;
++        auto patch = std::make_unique<LoadedPatch> (identity, location, description);
++
++        // A state that cmajor can't apply just leaves the patch at its defaults.
++        if (patch->isValid() && cmajorState)
++            patch->loadState (*cmajorState);
++
++        if (! patch->isValid())
++            error = "Could not create " + description.name;
++        else if (! patch->activate (sampleRate, maxFrames))
++            error = patch->getBuildError();
++
++        building = false;
++
++        if (! error.empty())
 +        {
-+            wrapper.plugin->stop_processing (wrapper.plugin.get());
-+            wrapper.processing = false;
++            retirePatch (std::move (patch));
++            return {};
 +        }
 +
-+        wrapper.plugin->deactivate (wrapper.plugin.get());
-+        wrapper.active = false;
++        return patch;
 +    }
 +
-+    auto maxFrames = static_cast<uint32_t> (buffer->num_frames (buffer));
-+
-+    wrapper.active = wrapper.plugin->activate (wrapper.plugin.get(), static_cast<double> (sampleRate), 1, maxFrames);
-+
-+    if (wrapper.active)
++    // Makes `next` (null meaning none) the current patch, retiring the previous one. Until the
++    // plugin is prepared there's never a `next`, and only the patch to build at prepare() is set.
++    void publish (std::unique_ptr<LoadedPatch> next, const std::string& identity, std::optional<PatchDescription> description,
++                  std::optional<std::string> cmajorState, const std::string& error)
 +    {
-+        wrapper.rebuildSilentInputs (maxFrames);
-+        wrapper.rebuildParameterTable();
-+        wrapper.notifyParameterLayoutChanged();
++        auto table = next != nullptr ? next->createParameterTable() : std::make_unique<ParameterTable>();
++
++        {
++            std::lock_guard<std::mutex> patchLock (patchMutex);
++
++            {
++                std::lock_guard<std::mutex> processLock (processMutex);
++                std::swap (current, next);
++                publishParameterTable (std::move (table));
++            }
++
++            currentIdentity = identity;
++            currentDescription = std::move (description);
++            pendingState = current != nullptr ? std::nullopt : std::move (cmajorState);
++            lastError = error;
++            ++generation;
++            ++revision;
++        }
++
++        notifyParameterLayoutChanged();
++        retirePatch (std::move (next));
 +    }
++
++    // Published tables are never freed while the plugin is alive, since the host may be
++    // reading the previous one on another thread (and the audio thread reads it lock-free).
++    void publishParameterTable (std::unique_ptr<ParameterTable> table)
++    {
++        std::lock_guard<std::mutex> lock (parameterTablesMutex);
++        parameterTable.store (table.get(), std::memory_order_release);
++        parameterTables.push_back (std::move (table));
++    }
++
++    void notifyParameterLayoutChanged()
++    {
++        if (released || aapHost == nullptr || aapHost->get_extension == nullptr)
++            return;
++
++        if (auto ext = static_cast<aap_parameters_host_extension_t*> (aapHost->get_extension (aapHost, AAP_PARAMETERS_EXTENSION_URI)))
++            if (ext->notify_parameters_changed != nullptr)
++                ext->notify_parameters_changed (ext, aapHost);
++    }
++
++    //==============================================================================
++    std::mutex loadMutex;
++    bool prepared = false;
++    double sampleRate = 0;
++    uint32_t maxFrames = 0;
++    std::atomic<bool> building { false };
++
++    std::mutex patchMutex;
++    std::string currentIdentity;
++    std::optional<PatchDescription> currentDescription;
++    std::optional<std::string> pendingState; // the state to apply to the patch once it's built
++    std::string lastError;
++    uint32_t generation = 0, revision = 0;
++
++    std::mutex stateForSizeMutex;
++    std::string stateForSize;
++
++    std::mutex parameterTablesMutex;
++    std::vector<std::unique_ptr<ParameterTable>> parameterTables;
++    std::atomic<const ParameterTable*> parameterTable { nullptr };
++};
++
++// AAP's plugin_specific holds a shared pointer to the Wrapper, so that a JNI call working on it
++// (see findWrapper()) keeps it alive even if the instance is released meanwhile.
++using WrapperHolder = std::shared_ptr<Wrapper>;
++static std::mutex wrapperHoldersMutex;
++
++inline Wrapper& getWrapper (AndroidAudioPlugin* plugin)  { return **static_cast<WrapperHolder*> (plugin->plugin_specific); }
++
++//==============================================================================
++void aapPrepare (AndroidAudioPlugin* plugin, int32_t sampleRate, aap_buffer_t* buffer)
++{
++    getWrapper (plugin).prepare (static_cast<double> (sampleRate), static_cast<uint32_t> (buffer->num_frames (buffer)));
 +}
 +
 +void aapActivate (AndroidAudioPlugin* plugin)
 +{
-+    auto& wrapper = *static_cast<Wrapper*> (plugin->plugin_specific);
-+
-+    if (wrapper.active && ! wrapper.processing)
-+        wrapper.processing = wrapper.plugin->start_processing (wrapper.plugin.get());
++    getWrapper (plugin).hostActive = true;
 +}
 +
 +//==============================================================================
@@ -763,17 +1394,18 @@ index 0000000..1b1eba0
 +    wrapper.numPendingEvents = 0;
 +
 +    auto table = wrapper.getParameterTable();
++    auto port = wrapper.descriptor.midi2In;
 +
-+    if (table == nullptr || buffer->num_ports (buffer) <= Port::midi2In)
++    if (table == nullptr || buffer->num_ports (buffer) <= static_cast<int32_t> (port))
 +        return;
 +
-+    auto header = static_cast<AAPMidiBufferHeader*> (buffer->get_buffer (buffer, Port::midi2In));
++    auto header = static_cast<AAPMidiBufferHeader*> (buffer->get_buffer (buffer, port));
 +
 +    if (header == nullptr)
 +        return;
 +
 +    auto data = reinterpret_cast<const uint8_t*> (header + 1);
-+    auto capacity = static_cast<uint32_t> (buffer->get_buffer_size (buffer, Port::midi2In));
++    auto capacity = static_cast<uint32_t> (buffer->get_buffer_size (buffer, port));
 +    auto length = std::min<uint32_t> (header->length, capacity > sizeof (AAPMidiBufferHeader) ? capacity - sizeof (AAPMidiBufferHeader) : 0);
 +
 +    auto addChange = [&] (uint32_t parameterIndex, uint32_t transportValue)
@@ -866,11 +1498,13 @@ index 0000000..1b1eba0
 +    wrapper.midiOut = nullptr;
 +    wrapper.midiOutCapacity = 0;
 +
-+    if (buffer->num_ports (buffer) <= Port::midi2Out)
++    auto port = wrapper.descriptor.midi2Out;
++
++    if (buffer->num_ports (buffer) <= static_cast<int32_t> (port))
 +        return;
 +
-+    auto header = static_cast<AAPMidiBufferHeader*> (buffer->get_buffer (buffer, Port::midi2Out));
-+    auto size = static_cast<uint32_t> (buffer->get_buffer_size (buffer, Port::midi2Out));
++    auto header = static_cast<AAPMidiBufferHeader*> (buffer->get_buffer (buffer, port));
++    auto size = static_cast<uint32_t> (buffer->get_buffer_size (buffer, port));
 +
 +    if (header == nullptr || size <= sizeof (AAPMidiBufferHeader))
 +        return;
@@ -917,24 +1551,41 @@ index 0000000..1b1eba0
 +    };
 +}
 +
++inline float* getAudioBuffer (aap_buffer_t* buffer, int32_t port)
++{
++    return port >= 0 && port < buffer->num_ports (buffer) ? static_cast<float*> (buffer->get_buffer (buffer, port)) : nullptr;
++}
++
 +void aapProcess (AndroidAudioPlugin* plugin, aap_buffer_t* buffer, int32_t frameCount, int64_t)
 +{
-+    auto& wrapper = *static_cast<Wrapper*> (plugin->plugin_specific);
++    auto& wrapper = getWrapper (plugin);
++    auto& ports = wrapper.descriptor;
++    auto numFrames = static_cast<uint32_t> (frameCount);
 +
 +    beginMidiOutput (wrapper, buffer);
 +
-+    if (! wrapper.processing)
++    auto inL = getAudioBuffer (buffer, ports.audioInLeft);
++    auto inR = getAudioBuffer (buffer, ports.audioInRight);
++    auto outL = getAudioBuffer (buffer, static_cast<int32_t> (ports.audioOutLeft));
++    auto outR = getAudioBuffer (buffer, static_cast<int32_t> (ports.audioOutRight));
++
++    // Never wait for a patch switch to finish - output silence instead.
++    std::unique_lock<std::mutex> lock (wrapper.processMutex, std::try_to_lock);
++    auto patch = lock.owns_lock() ? wrapper.current.get() : nullptr;
++
++    if (patch == nullptr || ! patch->active || ! wrapper.hostActive || numFrames > patch->audioRouting.maxFrames)
++    {
++        for (auto channel : { outL, outR })
++            if (channel != nullptr)
++                std::fill_n (channel, numFrames, 0.0f);
++
 +        return;
++    }
 +
 +    collectInputEvents (wrapper, buffer);
 +
-+    std::array<float*, 2> outChannels
-+    {
-+        static_cast<float*> (buffer->get_buffer (buffer, Port::audioOutLeft)),
-+        static_cast<float*> (buffer->get_buffer (buffer, Port::audioOutRight))
-+    };
-+
-+    clap_audio_buffer_t outputs { outChannels.data(), nullptr, 2, 0, 0 };
++    auto& routing = patch->audioRouting;
++    routing.connect (inL, inR, outL, outR, numFrames);
 +
 +    auto inputEvents = createInputEventQueue (wrapper);
 +    auto outputEvents = createOutputEventQueue (wrapper);
@@ -942,33 +1593,26 @@ index 0000000..1b1eba0
 +    const clap_process_t process
 +    {
 +        -1,
-+        static_cast<uint32_t> (frameCount),
++        numFrames,
 +        nullptr,
-+        wrapper.silentInputs.data(),
-+        std::addressof (outputs),
-+        static_cast<uint32_t> (wrapper.silentInputs.size()),
-+        1,
++        routing.inputs.data(),
++        routing.outputs.data(),
++        static_cast<uint32_t> (routing.inputs.size()),
++        static_cast<uint32_t> (routing.outputs.size()),
 +        std::addressof (inputEvents),
 +        std::addressof (outputEvents)
 +    };
 +
-+    wrapper.plugin->process (wrapper.plugin.get(), std::addressof (process));
++    patch->plugin->process (patch->plugin.get(), std::addressof (process));
++    routing.completeOutput (outL, outR, numFrames);
 +}
 +
 +void aapDeactivate (AndroidAudioPlugin* plugin)
 +{
-+    auto& wrapper = *static_cast<Wrapper*> (plugin->plugin_specific);
-+
-+    if (wrapper.processing)
-+    {
-+        wrapper.plugin->stop_processing (wrapper.plugin.get());
-+        wrapper.processing = false;
-+    }
++    getWrapper (plugin).hostActive = false;
 +}
 +
 +//==============================================================================
-+inline Wrapper& getWrapper (AndroidAudioPlugin* plugin)  { return *static_cast<Wrapper*> (plugin->plugin_specific); }
-+
 +static aap_parameters_extension_t parametersExtension
 +{
 +    nullptr,
@@ -1000,39 +1644,67 @@ index 0000000..1b1eba0
 +    [] (aap_parameters_extension_t*, AndroidAudioPlugin*, int32_t, int32_t) -> aap_parameter_enum_t { return {}; }
 +};
 +
++static aap_state_extension_t stateExtension
++{
++    nullptr,
++    [] (aap_state_extension_t*, AndroidAudioPlugin* plugin) -> size_t
++    {
++        return getWrapper (plugin).getStateSize();
++    },
++    [] (aap_state_extension_t*, AndroidAudioPlugin* plugin, aap_state_t* destination)
++    {
++        if (destination != nullptr && destination->data != nullptr)
++            getWrapper (plugin).getState (*destination);
++    },
++    [] (aap_state_extension_t*, AndroidAudioPlugin* plugin, aap_state_t* source)
++    {
++        if (source != nullptr && source->data != nullptr)
++            getWrapper (plugin).setState ({ static_cast<const char*> (source->data), source->data_size });
++    }
++};
++
 +void* aapGetExtension (AndroidAudioPlugin*, const char* uri)
 +{
 +    if (std::strcmp (uri, AAP_PARAMETERS_EXTENSION_URI) == 0)
 +        return std::addressof (parametersExtension);
 +
++    if (std::strcmp (uri, AAP_STATE_EXTENSION_URI) == 0)
++        return std::addressof (stateExtension);
++
 +    return nullptr;
 +}
 +
-+aap_plugin_info_t aapGetPluginInfo (AndroidAudioPlugin*)
++inline const PluginDescriptor& getDescriptor (aap_plugin_info_t* info)  { return *static_cast<const PluginDescriptor*> (info->context); }
++
++aap_plugin_info_t aapGetPluginInfo (AndroidAudioPlugin* plugin)
 +{
 +    aap_plugin_info_t info {};
++    info.context = const_cast<PluginDescriptor*> (std::addressof (getWrapper (plugin).descriptor));
 +
 +    info.plugin_package_name = [] (aap_plugin_info_t*) -> const char* { return "org.androidaudioplugin.ports.cmajor"; };
-+    info.plugin_local_name   = [] (aap_plugin_info_t*) -> const char* { return "AAPCMajorSample"; };
-+    info.display_name        = [] (aap_plugin_info_t*) -> const char* { return "AAP Cmajor Sample"; };
++    info.plugin_local_name   = [] (aap_plugin_info_t* i) -> const char* { return getDescriptor (i).localName; };
++    info.display_name        = [] (aap_plugin_info_t* i) -> const char* { return getDescriptor (i).displayName; };
 +    info.developer_name      = [] (aap_plugin_info_t*) -> const char* { return "AAP Developers"; };
 +    info.version             = [] (aap_plugin_info_t*) -> const char* { return "0.1"; };
-+    info.primary_category    = [] (aap_plugin_info_t*) -> const char* { return "Instrument"; };
-+    info.identifier_string   = [] (aap_plugin_info_t*) -> const char* { return "urn:org.androidaudioplugin/samples/cmajor/AAPCMajorSample"; };
-+    info.plugin_id           = [] (aap_plugin_info_t*) -> const char* { return "urn:org.androidaudioplugin/samples/cmajor/AAPCMajorSample"; };
++    info.primary_category    = [] (aap_plugin_info_t* i) -> const char* { return getDescriptor (i).category; };
++    info.identifier_string   = [] (aap_plugin_info_t* i) -> const char* { return getDescriptor (i).pluginID; };
++    info.plugin_id           = [] (aap_plugin_info_t* i) -> const char* { return getDescriptor (i).pluginID; };
 +
-+    info.get_port_count = [] (aap_plugin_info_t*) -> uint32_t { return static_cast<uint32_t> (Port::numAudioPorts); };
++    info.get_port_count = [] (aap_plugin_info_t* i) -> uint32_t { return static_cast<uint32_t> (getDescriptor (i).audioPorts.size()); };
 +
-+    info.get_port = [] (aap_plugin_info_t*, uint32_t index) -> aap_plugin_info_port_t
++    info.get_port = [] (aap_plugin_info_t* i, uint32_t index) -> aap_plugin_info_port_t
 +    {
 +        aap_plugin_info_port_t port {};
-+        port.context = const_cast<PortInfo*> (std::addressof (ports[index]));
++        auto& audioPorts = getDescriptor (i).audioPorts;
++
++        if (index >= audioPorts.size())
++            return port;
++
++        port.context = const_cast<PortInfo*> (std::addressof (audioPorts[index]));
 +        port.index = [] (aap_plugin_info_port_t* p) -> uint32_t { return static_cast<PortInfo*> (p->context)->index; };
 +        port.name = [] (aap_plugin_info_port_t* p) -> const char* { return static_cast<PortInfo*> (p->context)->name; };
 +        port.content_type = [] (aap_plugin_info_port_t*) -> aap_content_type { return AAP_CONTENT_TYPE_AUDIO; };
-+
-+        port.direction = [] (aap_plugin_info_port_t*) -> aap_port_direction { return AAP_PORT_DIRECTION_OUTPUT; };
-+
++        port.direction = [] (aap_plugin_info_port_t* p) -> aap_port_direction { return static_cast<PortInfo*> (p->context)->direction; };
 +        return port;
 +    };
 +
@@ -1067,18 +1739,18 @@ index 0000000..1b1eba0
 +    });
 +}
 +
-+AndroidAudioPlugin* aapInstantiate (AndroidAudioPluginFactory*, const char*, AndroidAudioPluginHost* host)
++AndroidAudioPlugin* aapInstantiate (AndroidAudioPluginFactory*, const char* pluginUniqueId, AndroidAudioPluginHost* host)
 +{
-+    initialiseChocForAndroid();
++    auto descriptor = pluginUniqueId != nullptr ? findPluginDescriptor (pluginUniqueId) : nullptr;
 +
-+    auto wrapper = std::make_unique<Wrapper> (host);
-+
-+    if (! wrapper->isValid())
++    if (descriptor == nullptr)
 +        return nullptr;
++
++    initialiseChocForAndroid();
 +
 +    return new AndroidAudioPlugin
 +    {
-+        wrapper.release(),
++        new WrapperHolder (std::make_shared<Wrapper> (*descriptor, host)),
 +        aapPrepare,
 +        aapActivate,
 +        aapProcess,
@@ -1090,34 +1762,48 @@ index 0000000..1b1eba0
 +
 +void aapRelease (AndroidAudioPluginFactory*, AndroidAudioPlugin* instance)
 +{
-+    delete static_cast<Wrapper*> (instance->plugin_specific);
++    WrapperHolder wrapper;
++
++    {
++        std::lock_guard<std::mutex> lock (wrapperHoldersMutex);
++        auto holder = static_cast<WrapperHolder*> (instance->plugin_specific);
++        wrapper = std::move (*holder);
++        delete holder;
++        instance->plugin_specific = nullptr;
++    }
++
++    wrapper->released = true;
 +    delete instance;
 +}
 +
 +static AndroidAudioPluginFactory factory { aapInstantiate, aapRelease, nullptr };
 +
 +//==============================================================================
-+// Native UI support for CmajorPatchViewFactory.java. These are called on the main thread.
-+inline Wrapper* findWrapper (jlong serviceInstance, jint instanceId)
++// Support for CmajorNative.kt, called from the plugin's own UI.
++inline WrapperHolder findWrapper (jlong serviceInstance, jint instanceId)
 +{
++    std::lock_guard<std::mutex> lock (wrapperHoldersMutex);
 +    auto service = reinterpret_cast<::aap::PluginService*> (serviceInstance);
 +    auto instance = service != nullptr ? service->getLocalInstance (instanceId) : nullptr;
 +    auto plugin = instance != nullptr ? instance->getPlugin() : nullptr;
-+    return plugin != nullptr ? static_cast<Wrapper*> (plugin->plugin_specific) : nullptr;
++    auto holder = plugin != nullptr ? static_cast<WrapperHolder*> (plugin->plugin_specific) : nullptr;
++    return holder != nullptr ? *holder : nullptr;
 +}
 +
-+// The size of the patch's own view in CSS pixels, if the patch has one.
-+inline std::optional<std::array<uint32_t, 2>> getPatchViewSize()
++inline std::string toString (JNIEnv* env, jstring s)
 +{
-+    initialiseChocForAndroid();
-+
-+    auto manifest = createEnvironment().makePatchManifest (patchManifestFile);
-+    auto view = manifest.findDefaultView();
-+
-+    if (view == nullptr || view->getSource().empty())
++    if (s == nullptr)
 +        return {};
 +
-+    return std::array<uint32_t, 2> { view->getWidth(), view->getHeight() };
++    auto chars = env->GetStringUTFChars (s, nullptr);
++    std::string result (chars != nullptr ? chars : "");
++    env->ReleaseStringUTFChars (s, chars);
++    return result;
++}
++
++inline jstring toJavaString (JNIEnv* env, const std::string& s)
++{
++    return env->NewStringUTF (s.c_str());
 +}
 +
 +} // namespace cmaj::plugin::aap
@@ -1127,10 +1813,35 @@ index 0000000..1b1eba0
 +    return &cmaj::plugin::aap::factory;
 +}
 +
-+extern "C" JNIEXPORT jintArray JNICALL
-+Java_org_androidaudioplugin_ports_cmajor_CmajorPatchViewFactory_getPatchViewSize (JNIEnv* env, jclass)
++// Blocks while the patch is built. Returns an error message, or null on success.
++extern "C" JNIEXPORT jstring JNICALL
++Java_org_androidaudioplugin_ports_cmajor_CmajorNative_loadPatch (JNIEnv* env, jclass, jlong serviceInstance, jint instanceId, jstring identity)
 +{
-+    auto size = cmaj::plugin::aap::getPatchViewSize();
++    using namespace cmaj::plugin::aap;
++
++    auto wrapper = findWrapper (serviceInstance, instanceId);
++
++    if (wrapper == nullptr)
++        return toJavaString (env, "The plugin instance is gone");
++
++    auto error = wrapper->loadPatch (toString (env, identity), std::nullopt, true);
++    return error.empty() ? nullptr : toJavaString (env, error);
++}
++
++// Returns the instance's patch status as JSON (see Wrapper::getStatus()), or null if the instance is gone.
++extern "C" JNIEXPORT jstring JNICALL
++Java_org_androidaudioplugin_ports_cmajor_CmajorNative_getPatchStatus (JNIEnv* env, jclass, jlong serviceInstance, jint instanceId)
++{
++    auto wrapper = cmaj::plugin::aap::findWrapper (serviceInstance, instanceId);
++    return wrapper != nullptr ? cmaj::plugin::aap::toJavaString (env, wrapper->getStatus()) : nullptr;
++}
++
++// The size of the current patch's own view in CSS pixels, or null if it has none.
++extern "C" JNIEXPORT jintArray JNICALL
++Java_org_androidaudioplugin_ports_cmajor_CmajorNative_getPatchViewSize (JNIEnv* env, jclass, jlong serviceInstance, jint instanceId)
++{
++    auto wrapper = cmaj::plugin::aap::findWrapper (serviceInstance, instanceId);
++    auto size = wrapper != nullptr ? wrapper->getViewSize() : std::nullopt;
 +
 +    if (! size)
 +        return nullptr;
@@ -1141,20 +1852,21 @@ index 0000000..1b1eba0
 +    return result;
 +}
 +
-+extern "C" JNIEXPORT jboolean JNICALL
-+Java_org_androidaudioplugin_ports_cmajor_CmajorPatchViewFactory_attachEditor (JNIEnv*, jclass, jlong serviceInstance, jint instanceId,
-+                                                                              jdouble scale, jobject parentViewGroup)
++// Returns the generation of the patch whose editor was attached, or -1.
++extern "C" JNIEXPORT jint JNICALL
++Java_org_androidaudioplugin_ports_cmajor_CmajorNative_attachEditor (JNIEnv*, jclass, jlong serviceInstance, jint instanceId,
++                                                                    jdouble scale, jobject parentViewGroup)
 +{
 +    auto wrapper = cmaj::plugin::aap::findWrapper (serviceInstance, instanceId);
-+    return wrapper != nullptr && wrapper->attachEditor (parentViewGroup, scale);
++    return wrapper != nullptr ? wrapper->attachEditor (parentViewGroup, scale) : -1;
 +}
 +
 +// The UI session may outlive the plugin instance, in which case its editor is already gone.
 +extern "C" JNIEXPORT void JNICALL
-+Java_org_androidaudioplugin_ports_cmajor_CmajorPatchViewFactory_detachEditor (JNIEnv*, jclass, jlong serviceInstance, jint instanceId)
++Java_org_androidaudioplugin_ports_cmajor_CmajorNative_detachEditor (JNIEnv*, jclass, jlong serviceInstance, jint instanceId, jint generation)
 +{
 +    if (auto wrapper = cmaj::plugin::aap::findWrapper (serviceInstance, instanceId))
-+        wrapper->closeEditor();
++        wrapper->detachEditor (generation);
 +}
 diff --git a/modules/plugin/include/clap/cmaj_CLAPPlugin.h b/modules/plugin/include/clap/cmaj_CLAPPlugin.h
 index 5b90517..ba2db17 100644
