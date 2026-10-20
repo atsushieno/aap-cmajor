@@ -17,21 +17,3 @@ dependencyResolutionManagement {
 rootProject.name = "aap-cmajor"
 include(":app")
 
-// Dogfooding the buses work: use the aap-core working tree.
-include(":androidaudioplugin")
-project(":androidaudioplugin").projectDir = new File("/Users/atsushi/sources/AAP/aap-core/androidaudioplugin")
-include(":androidaudioplugin-manager")
-project(":androidaudioplugin-manager").projectDir = new File("/Users/atsushi/sources/AAP/aap-core/androidaudioplugin-manager")
-include(":androidaudioplugin-midi-device-service")
-project(":androidaudioplugin-midi-device-service").projectDir = new File("/Users/atsushi/sources/AAP/aap-core/androidaudioplugin-midi-device-service")
-include(":androidaudioplugin-ui-compose")
-project(":androidaudioplugin-ui-compose").projectDir = new File("/Users/atsushi/sources/AAP/aap-core/androidaudioplugin-ui-compose")
-include(":androidaudioplugin-ui-compose-app")
-project(":androidaudioplugin-ui-compose-app").projectDir = new File("/Users/atsushi/sources/AAP/aap-core/androidaudioplugin-ui-compose-app")
-include(":androidaudioplugin-ui-web")
-project(":androidaudioplugin-ui-web").projectDir = new File("/Users/atsushi/sources/AAP/aap-core/androidaudioplugin-ui-web")
-include(":androidaudioplugin-js-controller")
-project(":androidaudioplugin-js-controller").projectDir = new File("/Users/atsushi/sources/AAP/aap-core/androidaudioplugin-js-controller")
-include(":androidaudioplugin-testing")
-project(":androidaudioplugin-testing").projectDir = new File("/Users/atsushi/sources/AAP/aap-core/androidaudioplugin-testing")
-
