@@ -271,10 +271,10 @@ index 0000000..7e475c1
 +)
 diff --git a/modules/plugin/include/aap/cmaj_AAPPlugin.cpp b/modules/plugin/include/aap/cmaj_AAPPlugin.cpp
 new file mode 100644
-index 0000000..2c0b6ff
+index 0000000..ad20281
 --- /dev/null
 +++ b/modules/plugin/include/aap/cmaj_AAPPlugin.cpp
-@@ -0,0 +1,1593 @@
+@@ -0,0 +1,1639 @@
 +//
 +//     ,ad888ba,                              88
 +//    d8"'    "8b
@@ -319,6 +319,8 @@ index 0000000..2c0b6ff
 +#include <aap/ext/parameters.h>
 +#include <aap/ext/midi.h>
 +#include <aap/ext/state.h>
++#include <aap/ext/buses.h>
++#include <aap/ext/plugin-info.h>
 +#include <aap/core/host/plugin-host.h>
 +#include <android/asset_manager_jni.h>
 +
@@ -344,16 +346,8 @@ index 0000000..2c0b6ff
 +static constexpr std::string_view assetPatchScheme = "cmajor-asset:///";
 +
 +//==============================================================================
-+// The app has two AAP plugins sharing all of this code: an instrument, and an effect that
-+// also has audio inputs. Their ports must match aap_metadata.xml (where the instrument gets
-+// aap-core's default port layout for instruments).
-+struct PortInfo
-+{
-+    uint32_t index;
-+    const char* name;
-+    aap_port_direction direction;
-+};
-+
++// The app has two AAP plugins sharing all of this code: an instrument, and an effect. Their
++// audio buses follow the loaded patch's audio ports (see AudioRouting and the buses extension).
 +struct PluginDescriptor
 +{
 +    const char* pluginID;
@@ -361,12 +355,7 @@ index 0000000..2c0b6ff
 +    const char* displayName;
 +    const char* category;
 +    const char* defaultPatchIdentity;
-+
-+    // AAP port indices, -1 where there's no such port
-+    int32_t audioInLeft, audioInRight;
-+    uint32_t audioOutLeft, audioOutRight, midi2In, midi2Out;
-+
-+    std::vector<PortInfo> audioPorts;
++    bool hasAudioInput; // in the default bus layout, before a patch is built
 +};
 +
 +static const PluginDescriptor instrumentPlugin
@@ -376,11 +365,7 @@ index 0000000..2c0b6ff
 +    "AAP Cmajor Instrument",
 +    "Instrument",
 +    "cmajor-asset:///patches/Pro54/Pro54.cmajorpatch",
-+    -1, -1, 0, 1, 2, 3,
-+    {
-+        { 0, "Audio Out L", AAP_PORT_DIRECTION_OUTPUT },
-+        { 1, "Audio Out R", AAP_PORT_DIRECTION_OUTPUT }
-+    }
++    false
 +};
 +
 +static const PluginDescriptor effectPlugin
@@ -390,14 +375,34 @@ index 0000000..2c0b6ff
 +    "AAP Cmajor Effect",
 +    "Effect",
 +    "cmajor-asset:///patches/Tremolo/Tremolo.cmajorpatch",
-+    0, 1, 2, 3, 4, 5,
++    true
++};
++
++// An AAP audio bus, i.e. one of the patch's audio ports.
++struct AudioBusInfo
++{
++    uint32_t id;
++    std::string name;
++    uint32_t channelCount;
++    std::string layout;
++
++    bool operator== (const AudioBusInfo& other) const
 +    {
-+        { 0, "Audio In L",  AAP_PORT_DIRECTION_INPUT },
-+        { 1, "Audio In R",  AAP_PORT_DIRECTION_INPUT },
-+        { 2, "Audio Out L", AAP_PORT_DIRECTION_OUTPUT },
-+        { 3, "Audio Out R", AAP_PORT_DIRECTION_OUTPUT }
++        return id == other.id && name == other.name && channelCount == other.channelCount && layout == other.layout;
 +    }
 +};
++
++// The default bus layout of each plugin (stereo), for when no patch is built yet.
++inline std::array<std::vector<AudioBusInfo>, 2> getDefaultBuses (const PluginDescriptor& descriptor)
++{
++    std::array<std::vector<AudioBusInfo>, 2> buses;
++
++    if (descriptor.hasAudioInput)
++        buses[0].push_back ({ 0, "Audio In", 2, "stereo" });
++
++    buses[1].push_back ({ 0x100, "Audio Out", 2, "stereo" });
++    return buses;
++}
 +
 +inline const PluginDescriptor* findPluginDescriptor (std::string_view pluginID)
 +{
@@ -639,11 +644,9 @@ index 0000000..2c0b6ff
 +};
 +
 +//==============================================================================
-+// Connects a patch's audio ports to the plugin's stereo ports. The CLAP plugin expects a buffer
-+// for each of the patch's audio ports, with the patch's own channel count. The first input port
-+// gets the plugin's audio input (a mono one gets L and R mixed), the first output port goes to the
-+// plugin's audio output (a mono one goes to both L and R), and other channels are fed with
-+// silence or discarded.
++// Connects a patch's audio ports to the plugin's audio buses, port by port. The main buses are
++// adapted when their channel counts differ (e.g. until the host prepares for a new bus layout);
++// other channels without a bus buffer are fed with silence or discarded.
 +struct AudioRouting
 +{
 +    void build (const clap_plugin& plugin, uint32_t maxFramesToUse)
@@ -655,95 +658,111 @@ index 0000000..2c0b6ff
 +
 +        auto audioPorts = static_cast<const clap_plugin_audio_ports_t*> (plugin.get_extension (std::addressof (plugin), CLAP_EXT_AUDIO_PORTS));
 +
-+        auto getChannelCounts = [&] (bool isInput)
++        auto getPorts = [&] (bool isInput)
 +        {
-+            std::vector<uint32_t> counts;
++            std::vector<AudioBusInfo> ports;
 +            auto numPorts = audioPorts != nullptr ? audioPorts->count (std::addressof (plugin), isInput) : 0;
 +
 +            for (uint32_t i = 0; i < numPorts; ++i)
 +            {
 +                clap_audio_port_info_t info {};
-+                counts.push_back (audioPorts->get (std::addressof (plugin), i, isInput, std::addressof (info)) ? info.channel_count : 0);
++
++                if (! audioPorts->get (std::addressof (plugin), i, isInput, std::addressof (info)))
++                    info.channel_count = 0;
++
++                std::string_view type = info.port_type != nullptr ? info.port_type : "";
++                ports.push_back ({ (isInput ? 0u : 0x100u) + i, info.name, info.channel_count,
++                                   type == CLAP_PORT_MONO || type == CLAP_PORT_STEREO ? std::string (type) : std::string() });
 +            }
 +
-+            return counts;
++            return ports;
 +        };
 +
-+        auto createBuffers = [] (const std::vector<uint32_t>& channelCounts, std::vector<float*>& channels,
++        auto createBuffers = [] (const std::vector<AudioBusInfo>& ports, std::vector<float*>& channels,
 +                                 std::vector<clap_audio_buffer_t>& buffers, float* defaultChannel)
 +        {
-+            channels.assign (std::accumulate (channelCounts.begin(), channelCounts.end(), size_t()), defaultChannel);
++            channels.assign (std::accumulate (ports.begin(), ports.end(), size_t(),
++                                              [] (size_t n, const AudioBusInfo& port) { return n + port.channelCount; }),
++                             defaultChannel);
 +            buffers.clear();
 +            auto next = channels.data();
 +
-+            for (auto count : channelCounts)
++            for (auto& port : ports)
 +            {
-+                buffers.push_back ({ next, nullptr, count, 0, 0 });
-+                next += count;
++                buffers.push_back ({ next, nullptr, port.channelCount, 0, 0 });
++                next += port.channelCount;
 +            }
 +        };
 +
-+        auto inputCounts = getChannelCounts (true);
-+        auto outputCounts = getChannelCounts (false);
-+        createBuffers (inputCounts, inputChannels, inputs, silence.data());
-+        createBuffers (outputCounts, outputChannels, outputs, discarded.data());
-+        numMainInputChannels = inputCounts.empty() ? 0 : inputCounts.front();
-+        numMainOutputChannels = outputCounts.empty() ? 0 : outputCounts.front();
++        buses[0] = getPorts (true);
++        buses[1] = getPorts (false);
++        createBuffers (buses[0], inputChannels, inputs, silence.data());
++        createBuffers (buses[1], outputChannels, outputs, discarded.data());
 +    }
 +
-+    // Audio thread: points the patch's main channels at the plugin's buffers (any of which may be null).
-+    void connect (const float* inL, const float* inR, float* outL, float* outR, uint32_t numFrames)
++    // Audio thread: points the patch's channels at the plugin's bus buffers.
++    void connect (aap_buffer_t* buffer, uint32_t numFrames)
 +    {
-+        auto orSilence = [this] (const float* channel) { return const_cast<float*> (channel != nullptr ? channel : silence.data()); };
++        for (uint32_t port = 0; port < inputs.size(); ++port)
++        {
++            auto& patchBuffer = inputs[port];
++            auto count = static_cast<uint32_t> (buffer->get_audio_channel_count (buffer, AAP_PORT_DIRECTION_INPUT, static_cast<int32_t> (port)));
++            auto channels = buffer->get_audio_channels (buffer, AAP_PORT_DIRECTION_INPUT, static_cast<int32_t> (port));
 +
-+        if (numMainInputChannels >= 2)
-+        {
-+            inputChannels[0] = orSilence (inL);
-+            inputChannels[1] = orSilence (inR);
-+        }
-+        else if (numMainInputChannels == 1)
-+        {
-+            if (inL != nullptr && inR != nullptr)
++            for (uint32_t c = 0; c < patchBuffer.channel_count; ++c)
++                patchBuffer.data32[c] = c < count ? channels[c] : silence.data();
++
++            if (port == 0 && patchBuffer.channel_count == 1 && count >= 2)
 +            {
 +                for (uint32_t i = 0; i < numFrames; ++i)
-+                    monoMix[i] = 0.5f * (inL[i] + inR[i]);
++                    monoMix[i] = 0.5f * (channels[0][i] + channels[1][i]);
 +
-+                inputChannels[0] = monoMix.data();
++                patchBuffer.data32[0] = monoMix.data();
 +            }
-+            else
++            else if (port == 0 && patchBuffer.channel_count >= 2 && count == 1)
 +            {
-+                inputChannels[0] = orSilence (inL != nullptr ? inL : inR);
++                patchBuffer.data32[1] = channels[0];
 +            }
 +        }
 +
-+        if (numMainOutputChannels >= 1)
-+            outputChannels[0] = outL != nullptr ? outL : discarded.data();
++        for (uint32_t port = 0; port < outputs.size(); ++port)
++        {
++            auto& patchBuffer = outputs[port];
++            auto count = static_cast<uint32_t> (buffer->get_audio_channel_count (buffer, AAP_PORT_DIRECTION_OUTPUT, static_cast<int32_t> (port)));
++            auto channels = buffer->get_audio_channels (buffer, AAP_PORT_DIRECTION_OUTPUT, static_cast<int32_t> (port));
 +
-+        if (numMainOutputChannels >= 2)
-+            outputChannels[1] = outR != nullptr ? outR : discarded.data();
++            for (uint32_t c = 0; c < patchBuffer.channel_count; ++c)
++                patchBuffer.data32[c] = c < count ? channels[c] : discarded.data();
++        }
 +    }
 +
-+    // Audio thread: fills the plugin's output channels that the patch didn't write to.
-+    void completeOutput (float* outL, float* outR, uint32_t numFrames)
++    // Audio thread: fills the plugin's output channels that the patch didn't write to
++    // (a mono main output is copied to the other channels of the main bus).
++    void completeOutput (aap_buffer_t* buffer, uint32_t numFrames)
 +    {
-+        if (numMainOutputChannels == 0)
++        for (int32_t port = 0, n = buffer->get_bus_count (buffer, AAP_BUS_KIND_AUDIO, AAP_PORT_DIRECTION_OUTPUT); port < n; ++port)
 +        {
-+            for (auto channel : { outL, outR })
-+                if (channel != nullptr)
-+                    std::fill_n (channel, numFrames, 0.0f);
-+        }
-+        else if (numMainOutputChannels == 1 && outL != nullptr && outR != nullptr)
-+        {
-+            std::copy_n (outL, numFrames, outR);
++            auto count = static_cast<uint32_t> (buffer->get_audio_channel_count (buffer, AAP_PORT_DIRECTION_OUTPUT, port));
++            auto channels = buffer->get_audio_channels (buffer, AAP_PORT_DIRECTION_OUTPUT, port);
++            auto written = static_cast<size_t> (port) < outputs.size() ? outputs[static_cast<size_t> (port)].channel_count : 0u;
++
++            for (uint32_t c = written; c < count; ++c)
++            {
++                if (port == 0 && written == 1)
++                    std::copy_n (channels[0], numFrames, channels[c]);
++                else
++                    std::fill_n (channels[c], numFrames, 0.0f);
++            }
 +        }
 +    }
 +
 +    uint32_t maxFrames = 0;
 +    std::vector<clap_audio_buffer_t> inputs, outputs;
++    // The patch's audio ports as AAP audio buses (0: input, 1: output).
++    std::array<std::vector<AudioBusInfo>, 2> buses;
 +
 +private:
 +    std::vector<float*> inputChannels, outputChannels;
-+    uint32_t numMainInputChannels = 0, numMainOutputChannels = 0;
 +    std::vector<float> silence, discarded, monoMix;
 +};
 +
@@ -975,7 +994,8 @@ index 0000000..2c0b6ff
 +struct Wrapper
 +{
 +    Wrapper (const PluginDescriptor& descriptorToUse, AndroidAudioPluginHost* hostToUse)
-+        : descriptor (descriptorToUse), aapHost (hostToUse), currentIdentity (descriptor.defaultPatchIdentity)
++        : descriptor (descriptorToUse), aapHost (hostToUse), currentIdentity (descriptor.defaultPatchIdentity),
++          reportedBuses (getDefaultBuses (descriptorToUse))
 +    {
 +        if (auto location = resolvePatchIdentity (currentIdentity))
 +            currentDescription = describePatch (*location);
@@ -986,6 +1006,13 @@ index 0000000..2c0b6ff
 +    ~Wrapper()
 +    {
 +        retirePatch (std::move (current));
++    }
++
++    // The audio buses that the plugin reports (0: input, 1: output).
++    std::array<std::vector<AudioBusInfo>, 2> getBuses()
++    {
++        std::lock_guard<std::mutex> lock (busesMutex);
++        return reportedBuses;
 +    }
 +
 +    //==============================================================================
@@ -1264,7 +1291,35 @@ index 0000000..2c0b6ff
 +        }
 +
 +        notifyParameterLayoutChanged();
++        updateBusLayout();
 +        retirePatch (std::move (next));
++    }
++
++    // The bus layout follows the current patch; the host prepares again when it changes.
++    void updateBusLayout()
++    {
++        std::array<std::vector<AudioBusInfo>, 2> buses;
++
++        {
++            std::lock_guard<std::mutex> patchLock (patchMutex);
++            buses = current != nullptr ? current->audioRouting.buses : getDefaultBuses (descriptor);
++        }
++
++        {
++            std::lock_guard<std::mutex> lock (busesMutex);
++
++            if (buses == reportedBuses)
++                return;
++
++            reportedBuses = std::move (buses);
++        }
++
++        if (released || aapHost == nullptr || aapHost->get_extension == nullptr)
++            return;
++
++        if (auto ext = static_cast<aap_buses_host_extension_t*> (aapHost->get_extension (aapHost, AAP_BUSES_EXTENSION_URI)))
++            if (ext->notify_buses_changed != nullptr)
++                ext->notify_buses_changed (ext, aapHost, AAP_BUSES_CHANGED_LAYOUT);
 +    }
 +
 +    // Published tables are never freed while the plugin is alive, since the host may be
@@ -1292,6 +1347,9 @@ index 0000000..2c0b6ff
 +    double sampleRate = 0;
 +    uint32_t maxFrames = 0;
 +    std::atomic<bool> building { false };
++
++    std::mutex busesMutex;
++    std::array<std::vector<AudioBusInfo>, 2> reportedBuses;
 +
 +    std::mutex patchMutex;
 +    std::string currentIdentity;
@@ -1394,18 +1452,13 @@ index 0000000..2c0b6ff
 +    wrapper.numPendingEvents = 0;
 +
 +    auto table = wrapper.getParameterTable();
-+    auto port = wrapper.descriptor.midi2In;
++    auto header = static_cast<AAPMidiBufferHeader*> (buffer->get_event_buffer (buffer, AAP_PORT_DIRECTION_INPUT, 0));
 +
-+    if (table == nullptr || buffer->num_ports (buffer) <= static_cast<int32_t> (port))
-+        return;
-+
-+    auto header = static_cast<AAPMidiBufferHeader*> (buffer->get_buffer (buffer, port));
-+
-+    if (header == nullptr)
++    if (table == nullptr || header == nullptr)
 +        return;
 +
 +    auto data = reinterpret_cast<const uint8_t*> (header + 1);
-+    auto capacity = static_cast<uint32_t> (buffer->get_buffer_size (buffer, port));
++    auto capacity = static_cast<uint32_t> (buffer->get_event_buffer_capacity (buffer, AAP_PORT_DIRECTION_INPUT, 0));
 +    auto length = std::min<uint32_t> (header->length, capacity > sizeof (AAPMidiBufferHeader) ? capacity - sizeof (AAPMidiBufferHeader) : 0);
 +
 +    auto addChange = [&] (uint32_t parameterIndex, uint32_t transportValue)
@@ -1498,13 +1551,8 @@ index 0000000..2c0b6ff
 +    wrapper.midiOut = nullptr;
 +    wrapper.midiOutCapacity = 0;
 +
-+    auto port = wrapper.descriptor.midi2Out;
-+
-+    if (buffer->num_ports (buffer) <= static_cast<int32_t> (port))
-+        return;
-+
-+    auto header = static_cast<AAPMidiBufferHeader*> (buffer->get_buffer (buffer, port));
-+    auto size = static_cast<uint32_t> (buffer->get_buffer_size (buffer, port));
++    auto header = static_cast<AAPMidiBufferHeader*> (buffer->get_event_buffer (buffer, AAP_PORT_DIRECTION_OUTPUT, 0));
++    auto size = static_cast<uint32_t> (buffer->get_event_buffer_capacity (buffer, AAP_PORT_DIRECTION_OUTPUT, 0));
 +
 +    if (header == nullptr || size <= sizeof (AAPMidiBufferHeader))
 +        return;
@@ -1551,23 +1599,23 @@ index 0000000..2c0b6ff
 +    };
 +}
 +
-+inline float* getAudioBuffer (aap_buffer_t* buffer, int32_t port)
++inline void clearAudioOutputs (aap_buffer_t* buffer, uint32_t numFrames)
 +{
-+    return port >= 0 && port < buffer->num_ports (buffer) ? static_cast<float*> (buffer->get_buffer (buffer, port)) : nullptr;
++    for (int32_t bus = 0, n = buffer->get_bus_count (buffer, AAP_BUS_KIND_AUDIO, AAP_PORT_DIRECTION_OUTPUT); bus < n; ++bus)
++    {
++        auto channels = buffer->get_audio_channels (buffer, AAP_PORT_DIRECTION_OUTPUT, bus);
++
++        for (int32_t c = 0, nc = buffer->get_audio_channel_count (buffer, AAP_PORT_DIRECTION_OUTPUT, bus); c < nc; ++c)
++            std::fill_n (channels[c], numFrames, 0.0f);
++    }
 +}
 +
 +void aapProcess (AndroidAudioPlugin* plugin, aap_buffer_t* buffer, int32_t frameCount, int64_t)
 +{
 +    auto& wrapper = getWrapper (plugin);
-+    auto& ports = wrapper.descriptor;
 +    auto numFrames = static_cast<uint32_t> (frameCount);
 +
 +    beginMidiOutput (wrapper, buffer);
-+
-+    auto inL = getAudioBuffer (buffer, ports.audioInLeft);
-+    auto inR = getAudioBuffer (buffer, ports.audioInRight);
-+    auto outL = getAudioBuffer (buffer, static_cast<int32_t> (ports.audioOutLeft));
-+    auto outR = getAudioBuffer (buffer, static_cast<int32_t> (ports.audioOutRight));
 +
 +    // Never wait for a patch switch to finish - output silence instead.
 +    std::unique_lock<std::mutex> lock (wrapper.processMutex, std::try_to_lock);
@@ -1575,17 +1623,14 @@ index 0000000..2c0b6ff
 +
 +    if (patch == nullptr || ! patch->active || ! wrapper.hostActive || numFrames > patch->audioRouting.maxFrames)
 +    {
-+        for (auto channel : { outL, outR })
-+            if (channel != nullptr)
-+                std::fill_n (channel, numFrames, 0.0f);
-+
++        clearAudioOutputs (buffer, numFrames);
 +        return;
 +    }
 +
 +    collectInputEvents (wrapper, buffer);
 +
 +    auto& routing = patch->audioRouting;
-+    routing.connect (inL, inR, outL, outR, numFrames);
++    routing.connect (buffer, numFrames);
 +
 +    auto inputEvents = createInputEventQueue (wrapper);
 +    auto outputEvents = createOutputEventQueue (wrapper);
@@ -1604,7 +1649,7 @@ index 0000000..2c0b6ff
 +    };
 +
 +    patch->plugin->process (patch->plugin.get(), std::addressof (process));
-+    routing.completeOutput (outL, outR, numFrames);
++    routing.completeOutput (buffer, numFrames);
 +}
 +
 +void aapDeactivate (AndroidAudioPlugin* plugin)
@@ -1663,10 +1708,42 @@ index 0000000..2c0b6ff
 +    }
 +};
 +
++static aap_buses_extension_t busesExtension
++{
++    nullptr,
++    [] (aap_buses_extension_t*, AndroidAudioPlugin* plugin, aap_bus_kind kind, aap_port_direction direction) -> int32_t
++    {
++        return kind == AAP_BUS_KIND_AUDIO ? static_cast<int32_t> (getWrapper (plugin).getBuses()[direction == AAP_PORT_DIRECTION_INPUT ? 0 : 1].size()) : 0;
++    },
++    [] (aap_buses_extension_t*, AndroidAudioPlugin* plugin, aap_bus_kind kind, aap_port_direction direction, int32_t index) -> aap_bus_info_t
++    {
++        aap_bus_info_t info {};
++        auto buses = getWrapper (plugin).getBuses()[direction == AAP_PORT_DIRECTION_INPUT ? 0 : 1];
++
++        if (kind != AAP_BUS_KIND_AUDIO || index < 0 || static_cast<size_t> (index) >= buses.size())
++            return info;
++
++        auto& bus = buses[static_cast<size_t> (index)];
++        info.id = bus.id;
++        info.kind = AAP_BUS_KIND_AUDIO;
++        info.direction = direction;
++        info.role = index == 0 ? AAP_BUS_ROLE_MAIN : AAP_BUS_ROLE_AUX;
++        std::strncpy (info.name, bus.name.c_str(), AAP_MAX_BUS_NAME_CHARS - 1);
++        info.channel_count = static_cast<int32_t> (bus.channelCount);
++        std::strncpy (info.layout, bus.layout.c_str(), AAP_MAX_BUS_LAYOUT_CHARS - 1);
++        info.enabled = true;
++        return info;
++    },
++    nullptr // the layout is the patch's own one
++};
++
 +void* aapGetExtension (AndroidAudioPlugin*, const char* uri)
 +{
 +    if (std::strcmp (uri, AAP_PARAMETERS_EXTENSION_URI) == 0)
 +        return std::addressof (parametersExtension);
++
++    if (std::strcmp (uri, AAP_BUSES_EXTENSION_URI) == 0)
++        return std::addressof (busesExtension);
 +
 +    if (std::strcmp (uri, AAP_STATE_EXTENSION_URI) == 0)
 +        return std::addressof (stateExtension);
@@ -1674,44 +1751,13 @@ index 0000000..2c0b6ff
 +    return nullptr;
 +}
 +
-+inline const PluginDescriptor& getDescriptor (aap_plugin_info_t* info)  { return *static_cast<const PluginDescriptor*> (info->context); }
-+
++// The host knows the actual ports, which follow the bus layout.
 +aap_plugin_info_t aapGetPluginInfo (AndroidAudioPlugin* plugin)
 +{
-+    aap_plugin_info_t info {};
-+    info.context = const_cast<PluginDescriptor*> (std::addressof (getWrapper (plugin).descriptor));
-+
-+    info.plugin_package_name = [] (aap_plugin_info_t*) -> const char* { return "org.androidaudioplugin.ports.cmajor"; };
-+    info.plugin_local_name   = [] (aap_plugin_info_t* i) -> const char* { return getDescriptor (i).localName; };
-+    info.display_name        = [] (aap_plugin_info_t* i) -> const char* { return getDescriptor (i).displayName; };
-+    info.developer_name      = [] (aap_plugin_info_t*) -> const char* { return "AAP Developers"; };
-+    info.version             = [] (aap_plugin_info_t*) -> const char* { return "0.1"; };
-+    info.primary_category    = [] (aap_plugin_info_t* i) -> const char* { return getDescriptor (i).category; };
-+    info.identifier_string   = [] (aap_plugin_info_t* i) -> const char* { return getDescriptor (i).pluginID; };
-+    info.plugin_id           = [] (aap_plugin_info_t* i) -> const char* { return getDescriptor (i).pluginID; };
-+
-+    info.get_port_count = [] (aap_plugin_info_t* i) -> uint32_t { return static_cast<uint32_t> (getDescriptor (i).audioPorts.size()); };
-+
-+    info.get_port = [] (aap_plugin_info_t* i, uint32_t index) -> aap_plugin_info_port_t
-+    {
-+        aap_plugin_info_port_t port {};
-+        auto& audioPorts = getDescriptor (i).audioPorts;
-+
-+        if (index >= audioPorts.size())
-+            return port;
-+
-+        port.context = const_cast<PortInfo*> (std::addressof (audioPorts[index]));
-+        port.index = [] (aap_plugin_info_port_t* p) -> uint32_t { return static_cast<PortInfo*> (p->context)->index; };
-+        port.name = [] (aap_plugin_info_port_t* p) -> const char* { return static_cast<PortInfo*> (p->context)->name; };
-+        port.content_type = [] (aap_plugin_info_port_t*) -> aap_content_type { return AAP_CONTENT_TYPE_AUDIO; };
-+        port.direction = [] (aap_plugin_info_port_t* p) -> aap_port_direction { return static_cast<PortInfo*> (p->context)->direction; };
-+        return port;
-+    };
-+
-+    info.get_parameter_count = [] (aap_plugin_info_t*) -> uint32_t { return 0; };
-+    info.get_parameter = [] (aap_plugin_info_t*, uint32_t) -> aap_plugin_info_parameter_t { return {}; };
-+
-+    return info;
++    auto& wrapper = getWrapper (plugin);
++    auto host = wrapper.aapHost;
++    auto ext = static_cast<aap_host_plugin_info_extension_t*> (host->get_extension (host, AAP_PLUGIN_INFO_EXTENSION_URI));
++    return ext != nullptr ? ext->get (ext, host, wrapper.descriptor.pluginID) : aap_plugin_info_t {};
 +}
 +
 +// choc's Android backend (used e.g. by cmaj::Patch to post parameter change notifications to
