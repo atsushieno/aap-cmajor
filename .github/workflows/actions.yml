@@ -1,6 +1,7 @@
 name: build dist
 
 on:
+  push:
   workflow_call:
 
 permissions:
